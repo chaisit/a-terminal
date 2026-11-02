@@ -1,0 +1,52 @@
+{
+  "$schema-note": "Subset of the Windows Terminal settings.json schema.",
+  "defaultProfile": "scaffold-demo",
+  "profiles": {
+    "defaults": {
+      "fontFace": "FiraCode Nerd Font, Cascadia Mono, Noto Sans Thai, monospace",
+      "fontSize": 14,
+      "historySize": 9001,
+      "snapOnInput": true,
+      "closeOnExit": "automatic",
+      "colorScheme": "Campbell"
+    },
+    "list": [
+      {
+        "guid": "scaffold-demo",
+        "name": "Echo (scaffold)",
+        "type": "echo",
+        "hidden": false
+      },
+      {
+        "guid": "termux-local",
+        "name": "Termux (local)",
+        "type": "termux",
+        "hidden": false,
+        "note": "Requires Termux running sshd on localhost:8022."
+      }
+    ]
+  },
+  "schemes": [
+    {
+      "name": "Campbell",
+      "foreground": "#CCCCCC",
+      "background": "#0C0C0C",
+      "cursorColor": "#FFFFFF",
+      "selectionBackground": "#3A3A3A",
+      "black": "#0C0C0C", "red": "#C50F1F", "green": "#13A10E", "yellow": "#C19C00",
+      "blue": "#0037DA", "purple": "#881798", "cyan": "#3A96DD", "white": "#CCCCCC",
+      "brightBlack": "#767676", "brightRed": "#E74856", "brightGreen": "#16C60C",
+      "brightYellow": "#F9F1A5", "brightBlue": "#3B78FF", "brightPurple": "#B4009E",
+      "brightCyan": "#61D6D6", "brightWhite": "#F2F2F2"
+    }
+  ],
+  "$keybindings-note": "Default chords are built in and mirror Windows Terminal. The entries below override them. See the project README.",
+  "keybindings": [
+    { "keys": "ctrl+shift+t", "command": "newTab" },
+    { "keys": "ctrl+shift+w", "command": "closeTab" },
+    { "keys": "ctrl+shift+f", "command": "find" }
+  ],
+  "copyOnSelect": false,
+  "trimPaste": true,
+  "autoPasteClipboard": false
+}

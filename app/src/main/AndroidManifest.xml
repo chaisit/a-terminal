@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- SSH backend ต้อง network -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <!-- termux backend: ต้อง declare เพื่อ query ว่า Termux ติดตั้งอยู่ไหม (Android 11+ package visibility) -->
+    <queries>
+        <package android:name="com.termux" />
+    </queries>
+
+    <!-- T1 (round 13): icon = adaptive vector ล้วน (glyph ">_" ใต้ res/, minSdk 29≥26 ไม่ต้องมี raster fallback)
+         label ย้ายเข้า strings.xml (release hygiene) -->
+    <application
+        android:label="@string/app_name"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:theme="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen"
+        android:allowBackup="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:supportsRtl="true">
+
+        <!-- R9 foldable (Honor Magic V5/V6): token เดิมขาด → พับ/กาง = recreate = session ตายทั้งวง (sessions activity-scoped)
+             - smallestScreenSize : ตัวชี้ขาด — พับ/กางเปลี่ยน minimum size ของ window; system ส่งคู่กับ density ทุกครั้ง
+             - screenLayout       : size class เปลี่ยน compact↔medium (fold), letterbox ใน multi-window
+             - density            : จอนอก ≠ จอใน — display swap แลก dpi; activity ไม่ recreate ถ้า declare
+             - layoutDirection    : supportsRtl=true แล้ว RTL flip ห้ามฆ่า session
+             resizeableActivity=true : split-screen terminal = use case จริง (≡ WT panes)
+             (T3 round 13: targetSdk 35 แล้ว — overturn ตัดสิน round 10; edge-to-edge บน API35 = bars โผล่จริง,
+              root padding อิง insets ใน KeyboardWatcher — ห้ามย้าย listener ออกไปจากตัวนั้น)
+             ที่เหลือ (grid/engine/renderer re-fit) อยู่ใน MainActivity.onConfigurationChanged — ห้ามให้ recreate กลับมา -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:resizeableActivity="true"
+            android:configChanges="orientation|screenSize|keyboardHidden|keyboard|smallestScreenSize|screenLayout|density|layoutDirection"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

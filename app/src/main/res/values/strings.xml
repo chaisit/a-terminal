@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- T1 (round 13): label ย้ายจาก inline ใน manifest → string resource (release hygiene: launcher อ่านได้ถูก tier) -->
+    <string name="app_name">A-Terminal</string>
+</resources>

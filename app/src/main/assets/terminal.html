@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<link rel="stylesheet" href="xterm/xterm.css">
+<style>
+  html, body { margin:0; padding:0; background:#0c0c0c; height:100%; overflow:hidden; }
+  #term { position:absolute; inset:8px 8px 40px 8px;
+          user-select:none; -webkit-user-select:none; -webkit-touch-callout:none; } /* กัน WebView native long-press menu รบกวน touch selection */
+  /* ตัวจริงของ native action mode (Translate/Cut/Copy) คือ helper textarea — ต้องปิดที่มันตรง ๆ
+     (programmatic setSelectionRange ของ xterm ยังทำงานใต้ user-select:none) */
+  /* pointer-events:none = long-press ไม่มีวันตกบน textarea (มันบังใต้ cursor พอดี) -> Chromium ไม่เปิด
+     editable selection menu; IME ไม่เสียเพราะ focus เป็น programmatics (term.focus) ไม่ใช่จาก touch */
+  .xterm-helper-textarea { user-select:none !important; -webkit-user-select:none !important;
+                           -webkit-touch-callout:none !important; }
+  /* ทุก DOM node ของ xterm (รวม helper textarea + accessibility text layer ซึ่งคือ text จริงที่
+     Chromium long-press hit-test เจอ) = ห้าม selectable; selection ของเราวาดบน canvas ไม่กระทบ */
+  #term, #term * { user-select:none !important; -webkit-user-select:none !important;
+                   -webkit-touch-callout:none !important; }
+  /* round 15-HW (Honor V6): font จริง bundling — 'Cascadia Mono/JetBrains Mono' ที่ผ่านมาไม่ได้ bundle
+     = WebView ตกไป system mono เงียบ (กับดักเดียวกับ round-11 ฝั่ง native) | subset 1.1MB, OFL (fonts/README.txt)
+     ชื่อ family ต้อง ≡ ชื่อจริงในไฟล์ ttf | bold = faux-bold ที่ Chromium synthesize (bundle มี weight เดียว) */
+  @font-face { font-family: 'FiraCode Nerd Font'; src: url('fonts/terminal.ttf') format('truetype');
+               font-weight: normal; font-display: block; }
+</style>
+</head>
+<body>
+<div id="term"></div>
+<script src="xterm/xterm.js"></script>
+<script src="xterm/addon-canvas.js"></script>  <!-- round 15-HW-2: canvas renderer (vendor MIT, ดู docs/xterm-umd-patch.md) -->
+<script src="xterm/addon-unicode11.js"></script>  <!-- round 15: emoji กว้าง 2 ช่อง ตรงกับ :engine (vendor MIT 0.8.0, ไม่ดัดแปลง) -->
+<script src="aterm-find.js"></script>  <!-- round 7: find bar (โปรเจกต์เขียน, zero patch) -->
+<script src="aterm-keys.js"></script>   <!-- round 7: chord dispatcher + markMode -->
+<script>
+// A-Terminal view layer — backend ผ่าน Droid bridge (Kotlin); bytes ขาเข้าทาง Aterm.onBytes
+function themeFromScheme() {
+  const t = { background: '#0c0c0c', foreground: '#cccccc' };
+  try {
+    const s = JSON.parse(window.Droid ? Droid.colorSchemeJson() : '{}');
+    for (const k of ['background','foreground','cursor','selection','black','red','green','yellow','blue','magenta','cyan','white',
+                     'brightBlack','brightRed','brightGreen','brightYellow','brightBlue','brightMagenta','brightCyan','brightWhite']) {
+      if (s[k]) t[k] = s[k];
+    }
+    if (s.cursorColor) t.cursor = s.cursorColor;
+    if (s.selectionBackground) t.selection = s.selectionBackground;
+    if (s.purple) t.magenta = s.purple;          // WT scheme ใช้ purple → xterm magenta
+    if (s.brightPurple) t.brightMagenta = s.brightPurple;
+  } catch (e) {}
+  return t;
+}
+
+// stack 3 ส่วน (round 15-HW): 1) 'FiraCode Nerd Font' = bundled (@font-face ด้านบน, Nerd icons สำหรับ tmux/powerline)
+// 2) 'Noto Sans Thai' = เจาะจง fallback ไทยแบบ deterministic บน canvas (ไม่มี monospace Thai ในโลก — per-glyph fallback)
+// 3) 'monospace' ท้ายสุด = safety ตามที่ xterm ต้องการ | ≡ default ใหม่ใน Settings.kt + settings.defaults.json
+const ATERM_FONT = 'FiraCode Nerd Font, Cascadia Mono, Noto Sans Thai, monospace';
+const term = new Terminal({
+  cursorBlink: true,
+  fontFamily: ATERM_FONT,
+  fontSize: 14,
+  // bundle 5.5 ไม่มี fontAscender/fontDescender (ตรวจกับ bundle แล้ว) — lineHeight คือปุ่มเดียวที่มี
+  // FiraCode ตั้ง 1.23em ในตัว (hhea) ไทยสามระดับยังมี Mai-ek/mai-tho เหนือ ascender → 1.2 (≒ native cellH 1.15em floor)
+  lineHeight: 1.2,
+  // xterm 5.5: ลดขนาด glyph ที่ล้น cell (ออกแบบเพื่อ Thai/CJK ที่ mark ไม่มี grapheme addon — ตรงบั๊ก Honor V6)
+  rescaleOverlappingGlyphs: true,
+  scrollback: 9001,
+  allowProposedApi: true, // term.unicode เป็น proposed API (verify กับ bundle: get unicode → _checkProposedApi)
+  theme: themeFromScheme(),
+});
+window.term = term;
+term.open(document.getElementById('term'));
+
+// round 15-HW-2 (user ตัดสิน, after DOM-renderer measurement): rescaleOverlappingGlyphs ถูก core อ่าน
+// แค่ใน option list — implementation (allowRescaling ตอนวาด glyph) อยู่แค่ใน renderer ของ
+// addon-canvas/webgl (verify กับ src 5.5.0 + lib/addon-canvas.js 0.7.0 จริง) และ core bundle ไม่มี
+// fillText = default ของเราคือ DOM renderer → option เดิม no-op, ไทยสามระดับเหลื่อมบน V6
+// = โหลด canvas renderer ให้ option ทำงานจริง | fail-soft: asset หาย/ctor พัง = อยู่ DOM renderer เดิม ไม่พัง boot
+try {
+  const CA = window.CanvasAddon && window.CanvasAddon.CanvasAddon; // UMD global = namespace object (verify กับ wrapper: e.CanvasAddon=t() ทั้ง namespace — ต่างจาก xterm.js ที่ copy key เข้า global)
+  if (CA) term.loadAddon(new CA());
+} catch (e) {}
+
+// round 15: Unicode 11 ให้ความกว้างตรงกับ :engine (ตารางเดียวกันจาก addon นี้) และโปรแกรมฝั่ง server เช่น tmux/vim
+// fail-soft: asset หาย/ctor พัง = อยู่ V6 เดิม ไม่พัง boot
+try {
+  const UA = window.Unicode11Addon && window.Unicode11Addon.Unicode11Addon;
+  if (UA) { term.loadAddon(new UA()); term.unicode.activeVersion = '11'; }
+} catch (e) {}
+
+// round 15-HW (Honor V6): xterm SelectionService refocus textarea ทุก mousedown (verify กับ bundle:
+// mousedown handler → this.focus() → textarea.focus) และ Chromium ImeAdapter เรียก showSoftInput
+// ใน-process ทันทีที่ touch DOWN ขณะที่ editor focus (measured api35: 5ms หลัง DOWN, ORIGIN_CLIENT)
+// = scroll ต่อจาก gesture ที่ปิด keyboard เด้งข้าม gate ทุกครั้ง → wrap focus() ให้ผ่านเฉพาะเมื่อ
+// Kotlin gate ตัดสินแล้วว่า tap (MainActivity.revealIme ตั้ง __atermAllowFocus=true ก่อน term.focus)
+//
+// round 15-HW-5 (Honor V6, user policy "คีย์บอร์ดเกิดได้เฉพาะตอนปล่อยนิ้ว tap"): วาล์วแบบ wrap focus
+// กันได้แค่ path ที่เรียก JS focus() — Chromium native touch-focus/long-press editor UI ไม่ผ่าน JS เลย
+// → เปลี่ยนเป็น accessor + `disabled`: ปิดวาล์ว = ta.disabled=true (focus ไม่ได้ *ทุก* path รวมถึง vendor;
+// bundle เขียนแค่ value/.select()/style — ไม่ต้อง focusability, ไม่มี site อ่าน disabled — verify แล้ว)
+// หมายเหตุ: คนละกรณีกับ readOnly-on-touchstart (NOTE ด้านล่าง selection) ที่เคยพัง — ตัวนั้นเปิด *ตอนพิมพ์*
+// = ตัด InputConnection; ตัวนี้ปิดเฉพาะสถานะ IME-ปิด (connection ตายอยู่แล้ว) และ accessor เปิดก่อน focus
+// ใน revealIme (js string เดียวกัน: allow=true → term.focus())
+(function () {
+  const ta = term.textarea;
+  if (!ta) return;
+  const orig = ta.focus.bind(ta);
+  let allow = false;
+  // *ไม่* set disabled ตอน init — ให้ flips ผ่าน setter เท่านั้น: (1) DOWN preempt ยันทันก่อน long-press
+  // timer อยู่แล้ว (2) อุปกรณ์ HW-keyboard (release) ที่ไม่เขียนวาล์วเลย = คง textarea focusable ตาม behavior เดิม
+  ta.focus = function () { if (allow) return orig.apply(null, arguments); };
+  Object.defineProperty(window, '__atermAllowFocus', {
+    get: function () { return allow; },
+    set: function (v) {
+      allow = !!v;
+      ta.disabled = !allow;                // sync ทุก path ที่เขียนวาล์ว (revealIme / closeFocusValveAllPanes)
+      if (!allow) { try { ta.blur(); } catch (e) {} }
+    },
+    configurable: true,
+  });
+})();
+
+// fit: ห้ามเชื่อ metrics เฟรมแรก — renderService อาจวัด cell size ยังไม่เสร็จ (cols/rows ชุดแรกผิดบนบาง device)
+// retry ถึง ~1s ก่อนยอมรับ fallback 8.4/20 แบบเดิม
+function fit(retry) {
+  const cell = (term._core && term._core._renderService && term._core._renderService.dimensions.css.cell) || {};
+  if ((!cell.width || !cell.height) && (retry || 0) < 20) { setTimeout(() => fit((retry || 0) + 1), 50); return; }
+  const cols = Math.max(20, Math.floor((innerWidth - 16) / (cell.width || 8.4)));
+  // round 7: find bar dock — aterm-find.js กัน top area ไว้ (กัน highlight แถวบนโดน bar บัง)
+  const inset = window.__atermInsetTop || 0;
+  // fallback 17→20 (round 15-HW): cellH จริงตอนนี้ ≈ 21px (14px × 1.23em × lineHeight 1.2) — ค่าเก่าทำให้ over-estimate rows ตอน metrics-starved
+  const rows = Math.max(6, Math.floor((innerHeight - 56 - inset) / (cell.height || 20)));
+  term.resize(cols, rows);
+  if (window.Droid) Droid.onResize(cols, rows);
+}
+addEventListener('resize', () => requestAnimationFrame(() => fit(0)));
+setTimeout(() => fit(0), 100);
+
+// round 15-HW: @font-face load = async — fit() แรก (+100ms) อาจวัด *fallback* font ก่อน ttf แลน
+// (FOUC-of-metrics: cellW/cellH ผิดถูกส่งเข้า PTY แล้วค่อยแก้ = grid กระโดด) → รอ fonts.load settle
+// แล้ว re-touch fontFamily (บังคับ re-measure แม้ค่าเดิม) + fit ซ้ำ | timeout 1500ms กัน device ที่
+// font load ไม่ settle จริง — PTY จะเห็น resize 2 ครั้งตอน boot (≈ พฤติกรรม rotate, vim/tmux redraw ครั้งเดียว: รับได้)
+if (document.fonts && document.fonts.load) {
+  const settle = () => {
+    // setter ของ xterm skip เมื่อค่าเท่าเดิม (ตรวจใน bundle: rawOptions[e]!==i เท่านั้นถึง fire)
+    // = ต้อง toggle ผ่านค่าชั่วคราว เพื่อบังคับ re-measure metrics หลัง ttf แลน
+    try {
+      const cur = term.options.fontFamily;
+      term.options.fontFamily = 'monospace';
+      term.options.fontFamily = cur;
+    } catch (e) {}
+    fit(0);
+  };
+  Promise.race([
+    document.fonts.load('14px "FiraCode Nerd Font"').catch(() => {}),
+    new Promise(res => setTimeout(res, 1500)),
+  ]).then(settle);
+}
+
+// round 7 gate: markMode on = ทุก byte ผ่าน AtermKeys ก่อน (enter=copy, esc=exit, arrows=เลื่อน selection)
+term.onData(data => { if (window.AtermKeys && AtermKeys.consumeIfMarkMode(data)) return; if (window.Droid) Droid.onInput(data); });
+// R4 mouse: report แบบ X10/VT200 ที่ไม่ขอ 1006 ออกทาง onBinary (latin1, coord >127 จะพังผ่าน String bridge)
+// — ส่ง base64 ไป decode ฝั่ง Kotlin; SGR (1006 = tmux/htop) วิ่ง onData เองแล้ว
+term.onBinary(s => { if (window.Droid && Droid.onBinaryBytes) Droid.onBinaryBytes(btoa(s)); });
+
+// copyOnSelect (WT global): selection เปลี่ยน -> copy เข้า clipboard ผ่าน native
+if (window.Droid && Droid.copyOnSelect && Droid.copyOnSelect()) {
+  term.onSelectionChange(() => {
+    if (window.__atermSilentSelect) return; // find/mark วาด selection ซ้ำ ๆ — ห้าม copy storm (round 7)
+    const s = term.getSelection();
+    if (s && window.Droid) Droid.copyToClipboard(s);
+  });
+}
+
+// ---- M3: long-press touch selection — xterm.js 5.5 ไม่มี touch selection (E19 LIMITED round 2) ----
+// long-press 500ms = เลือกคำ -> copy ผ่าน copyOnSelect (wire อยู่แล้ว) | drag = extend | tap = clear
+// ไม่แตะ backend: ใช้ buffer API + term.select เท่านั้น
+(function touchSelect() {
+  const HOLD = 500, SLOP = 12;
+  const WORD = /[\w.~\/:\-@+#]/;   // = class ที่ terminal double-click เลือก (ไม่รวมไทย — buffer cell-based)
+  let timer = null, start = null, anchor = null, selecting = false, hadSel = false, dragged = false;
+  // R4 mouse state: gate ต่อ gesture (DEC 1000/1002/1003 active เมื่อไหร่ = app request ไว้)
+  let mouseOn = false, moved = false, dominant = null, pressSent = false, wheelAcc = 0, lastCell = null, lastX = 0, lastY = 0, prevY = 0;
+  // copyOnSelect=false (ค่า default แบบ WT) = watcher ไม่ copy ให้; long-press เป็น explicit copy gesture
+  // จึง copy เองตรง ๆ — เมื่อ copyOnSelect=true ปล่อยให้ onSelectionChange ทำ (กัน toast ซ้ำ)
+  function copyIfManual() {
+    if (window.Droid && Droid.copyOnSelect && Droid.copyOnSelect()) return;
+    const s = term.getSelection();
+    if (s && window.Droid) Droid.copyToClipboard(s);
+    // long-press ของ Chromium ทิ้ง selection text ไว้ใน helper textarea (ตรวจเจอ value="echo" ค้าง)
+    // = residue ที่จะถูก input/shim ส่งซ้ำตอนพิมพ์ครั้งถัดไป -> ล้างทันทีหลัง copy
+    const t = taEl(); if (t) t.value = '';
+  }
+  const el = term.element;
+  const screen = () => el.querySelector('.xterm-screen') || el;
+  // ---- R4: mouse bytes — synthetic events รันเข้า listener ที่ xterm ผูกไว้บน element เอง (ไม่ต้อง patch) ----
+  // xterm อ่านแค่ clientX/clientY/button/buttons/deltaY; report ออกทาง onData (SGR) / onBinary (X10) ตาม mode
+  const mouseMode = () => (term.modes && term.modes.mouseTrackingMode) || "none";
+  const mm = (type, x, y, buttons) => el.dispatchEvent(
+    new MouseEvent(type, { clientX: x, clientY: y, button: 0, buttons: buttons, bubbles: true, cancelable: true }));
+  const wheelAt = (x, y, d) => el.dispatchEvent(
+    new WheelEvent('wheel', { deltaY: d, deltaMode: 0, clientX: x, clientY: y, bubbles: true, cancelable: true }));
+  function cellAt(x, y) {
+    const r = screen().getBoundingClientRect(), d = term._core._renderService.dimensions.css.cell;
+    const col = Math.floor((x - r.left) / d.width), row = Math.floor((y - r.top) / d.height);
+    return { col: Math.max(0, Math.min(term.cols - 1, col)), row: Math.max(0, Math.min(term.rows - 1, row)) };
+  }
+  function wordAt(p) {
+    const b = term.buffer.active, line = b.getLine(b.viewportY + p.row);
+    const s = line ? line.translateToString(true) : '';
+    const c = Math.min(p.col, s.length - 1);
+    if (c < 0 || !WORD.test(s[c])) return null;
+    let a = c, e = c + 1;
+    while (a > 0 && WORD.test(s[a - 1])) a--;
+    while (e < s.length && WORD.test(s[e])) e++;
+    return { col: a, end: e - 1 };
+  }
+  function selectCells(c0, r0, c1, r1) { // แถวที่มองเห็น -> linear offset; term.select ต้องการแถว absolute ของ buffer
+    const vy = term.buffer.active.viewportY;
+    let i0 = r0 * term.cols + c0, i1 = r1 * term.cols + c1;
+    if (i1 < i0) { const t = i0; i0 = i1; i1 = t; }
+    term.select(i0 % term.cols, vy + Math.floor(i0 / term.cols), i1 - i0 + 1);
+  }
+  el.addEventListener('touchstart', e => {
+    const t = e.touches[0];
+    start = { x: t.clientX, y: t.clientY }; hadSel = term.hasSelection();
+    selecting = false; clearTimeout(timer);
+    mouseOn = mouseMode() !== "none";   // R4: อ่านครั้งเดียวต่อ gesture (mouse mode เปลี่ยนโดยแอปผ่าน DECSET)
+    moved = false; dominant = null; pressSent = false; wheelAcc = 0; lastCell = null;
+    lastX = t.clientX; lastY = t.clientY; prevY = t.clientY;
+    timer = setTimeout(() => { // finger ยังนิ่งใน slop ครบ HOLD = long-press (mouseOn ก็ยังทำงาน = escape hatch เลือก/copy ข้อความ)
+      const p = cellAt(start.x, start.y), w = wordAt(p) || { col: p.col, end: p.col };
+      anchor = { col: w.col, row: p.row };
+      dragged = false;
+      selectCells(w.col, p.row, w.end, p.row);
+      copyIfManual();
+      selecting = true;
+      if (navigator.vibrate) navigator.vibrate(15);
+    }, HOLD);
+  }, { passive: true });
+  el.addEventListener('touchmove', e => {
+    if (selecting) {
+      e.preventDefault();                       // กัน scroll ระหว่างลากคลุม selection
+      const p = cellAt(e.touches[0].clientX, e.touches[0].clientY);
+      const w = wordAt(p);
+      const after = p.row > anchor.row || (p.row === anchor.row && p.col >= anchor.col);
+      selectCells(anchor.col, anchor.row, (w && after) ? w.end : p.col, p.row);
+      dragged = true;
+      return;
+    }
+    if (!start) return;
+    const t = e.touches[0];
+    const dx = t.clientX - start.x, dy = t.clientY - start.y;
+    if (Math.hypot(dx, dy) > SLOP) { clearTimeout(timer); timer = null; moved = true; } // เลื่อนนิ้วก่อน = ไม่ใช่ long-press
+    if (!mouseOn || !moved) return;             // mouse off = พฤติกรรมเหมือน round 3 ทุกประการ (gate ของ D1–D9)
+    e.preventDefault();                         // กัน native scroll + synthetic gesture ของ Chromium
+    lastX = t.clientX; lastY = t.clientY;
+    if (!dominant) dominant = Math.abs(dx) >= Math.abs(dy) ? "drag" : "wheel";
+    if (dominant === "wheel") {
+      // 1 notch ต่อ cell.height px: นิ้วลากลง = ดูของเก่า = wheel-up report (xterm: deltaY<0 → button code 64)
+      // magnitude ต้อง ≥ 1 row: getLinesScrolled (gate ของ wheel listener) คำนวณ deltaY/rowHeight แล้ว floor —
+      // ±1px = 0 บรรทัด = ไม่มี report (ตรวจบน device แล้ว round 4); ใช้ ±ch พอดี → partial เหลือ ~0
+      const ch = (term._core._renderService.dimensions.css.cell.height) || 17;
+      wheelAcc += t.clientY - prevY; prevY = t.clientY;
+      while (Math.abs(wheelAcc) >= ch) {
+        const sgn = wheelAcc > 0 ? 1 : -1;
+        wheelAt(t.clientX, t.clientY, -sgn * ch);
+        wheelAcc -= sgn * ch;
+      }
+    } else {
+      if (!pressSent) { mm("mousedown", start.x, start.y, 1); pressSent = true; lastCell = cellAt(start.x, start.y); }
+      const c = cellAt(t.clientX, t.clientY);   // dispatch เมื่อ cell เปลี่ยน (xterm มี drag dedup ใน triggerMouseEvent ครอบ lagi)
+      if (c.col !== lastCell.col || c.row !== lastCell.row) { mm("mousemove", t.clientX, t.clientY, 1); lastCell = c; }
+    }
+  }, { passive: false });
+  el.addEventListener('touchend', e => {
+    clearTimeout(timer); timer = null;
+    if (selecting) { // กัน touch handler ของ xterm (tap) มา clear selection ที่เราเพิ่งสร้าง
+      if (dragged) copyIfManual();              // ลาก extend จบ = copy ตัวสุดท้าย (single toast)
+      e.stopPropagation(); e.preventDefault(); selecting = false; return;
+    }
+    if (mouseOn) {                              // R4: ปิด gesture mouse (preventDefault กัน Chromium synth click = report ซ้ำ)
+      e.preventDefault(); e.stopPropagation();
+      if (pressSent) { mm("mouseup", lastX, lastY, 0); pressSent = false; }
+      else if (!moved && start) {               // tap = press+release ที่ cell เดิม → SGR click (htop F-key/mouse region)
+        mm("mousedown", start.x, start.y, 1); mm("mouseup", start.x, start.y, 0);
+      }
+      if (hadSel) term.clearSelection();
+      return;
+    }
+    if (hadSel) term.clearSelection();          // tap = clear selection (กัน selection ค้างมากิน paste)
+  }, { capture: true, passive: false });
+  el.addEventListener('touchcancel', () => {    // ถูกขัดจังหวะกลาง drag = ต้อง release press (ไม่งั้นแอปคิดว่าการกดค้างอยู่)
+    clearTimeout(timer); timer = null;
+    if (pressSent) { mm("mouseup", lastX, lastY, 0); pressSent = false; }
+  });
+  // NOTE (round 3): เคยมี trick set readOnly ตอน touchstart เพื่อกัน editable menu — มันปิด IME ทุกครั้ง
+  // (input connection หลุด) = UX แย่; layered defence ใหม่ = contextmenu preventDefault + ActionMode.finish
+  // ต้องทดสอบบน device (ครั้งก่อน ๆ ข้อมูลเสียเพราะ WebView cache เสิร์ฟไฟล์เก่า)
+  const taEl = () => document.querySelector('.xterm-helper-textarea');
+  // (readOnly listeners ถอดออก — ดู NOTE ข้างบน; ถ้า popup กลับมาค่อยคิดทางที่ดีกว่านี้)
+  el.addEventListener('contextmenu', e => e.preventDefault()); // กัน long-press menu ของ Chromium (อีกชั้นนอก over ActionMode.finish ฝั่ง native)
+  // selection menu ของ Chromium anchor กับ DOM selection — ไม่เคยมี DOM selection ที่เราต้องการเก็บ: ลบทิ้งทันที = menu พังไปเอง
+  document.addEventListener('selectionchange', () => {
+    if (/^(INPUT|TEXTAREA)$/.test((document.activeElement || {}).tagName || '')) return; // round 7: find <input> ต้องเลือกข้อความตัวเองได้
+    const s = document.getSelection();
+    if (s && !s.isCollapsed) s.removeAllRanges();
+  });
+})();
+
+// ---- Kotlin -> JS channel (SessionController เรียก evaluateJavascript) ----
+window.Aterm = {
+  // base64 chunk หนึ่ง batch -> bytes (binary string ผ่าน atob)
+  onBytes: function (b64) {
+    try {
+      const bin = atob(b64);
+      const arr = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+      term.write(arr);
+    } catch (e) {}
+  },
+  onStatus: function (json) {
+    // {state: 'connecting'|'connected'|'disconnected', message}
+    // แสดงผลจริงอยู่ที่ status strip ฝั่ง native — JS แค่เก็บไว้ใช้ decorate ได้
+    window.__atermStatus = json;
+  },
+  paste: function (text) { term.paste(text); },
+  setFont: function (px) { term.options.fontSize = px; fit(); },
+  // round 15-HW: profile.fontFace เคยขาดทางไป webview (มีแค่ fontSize ข้าม bridge) — เพิ่มตัวนี้
+  // Kotlin ส่ง JSON-string ที่ quote แล้ว; `window.Aterm &&` ฝั่ง caller = fail-soft ถ้า asset เก่าค้าง cache
+  setFontFace: function (css) { if (css) { term.options.fontFamily = css; fit(); } },
+  // round 7 — paths ที่ Kotlin ใช้ (ตาราง keybinding inject ฝั่ง AtermKeys.setTable เอง)
+  markKey: function (data) { if (window.AtermKeys) AtermKeys.markKey(data); },
+  clearBuffer: function (mode) { if (mode === 'screen') term.clear(); else term.reset(); },
+};
+
+// ---- IME shim v2 (round 3) ----
+// การแก้จริงอยู่ใน vendored xterm.js (P1 retry-diff, P2 input rescue, P3 paste preventDefault
+// — ดู docs/xterm-umd-patch.md + tools/patch_xterm_ime.py)
+// shim เดิม round 2 (keydown 40ms fallback) = ตัวการ char ซ้ำ เพราะส่งโดยไม่รู้ว่า xterm ส่งแล้ว -> ตัดทิ้ง
+// ที่เหลือ = catcher สำเนาสุดท้าย: bubbling ของเรา chạy *หลัง* input handler ของ xterm; ถ้า xterm
+// (patched) ส่งแล้วมันจะ mark term._core._dataAlreadySent — cross-check ก่อนส่งเอง = ไม่มีซ้ำ
+(function imeShim(tries) {
+  const ta = document.querySelector('.xterm-helper-textarea');
+  if (!ta) { if ((tries || 0) < 40) setTimeout(() => imeShim((tries || 0) + 1), 50); return; } // layout ช้า != inert เงียบ
+  ta.addEventListener('input', e => {
+    if (e.isComposing) return;                 // กลาง composition = ปล่อยให้ compositionHelper ของ xterm
+    const v = ta.value;
+    if (!v) return;
+    const sent = term._core && term._core._dataAlreadySent;
+    if (v !== sent) term.input(v, true);       // residue ที่ xterm (patched แล้วยัง) ทิ้ง = ส่งเอง
+    // P4 (round 15-HW-3): ทุก clear ต้องฆ่า retry chain ก่อน — ไม่งั้น chain ที่ arm ค้าง
+    // จะเห็น value หดเป็น '' เทียบ baseline เก่า = ยิง DEL เก้อทุก commit
+    const ch = term._core && term._core._compositionHelper;
+    if (ch) clearTimeout(ch._textareaRetryTimer);
+    ta.value = '';
+  });
+})(0);
+
+if (window.AtermFind) AtermFind.init(term);   // round 7 — init หลัง term.open() เสมอ
+if (window.AtermKeys) AtermKeys.init(term);
+
+term.writeln('A-Terminal — connecting…'); // boot marker: ทุก asset test ต้องเห็นข้อความนี้ก่อน = ไฟล์ใหม่จริง (บทเรียน cache poisoning round 3)
+term.focus();
+</script>
+</body>
+</html>

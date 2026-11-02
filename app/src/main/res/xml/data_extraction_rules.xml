@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- ไม่ส่งข้อมูลแอปออกทั้ง cloud backup และการย้ายเครื่อง: มี private key แบบ plaintext ใต้ files/keys
+     และ secrets.xml ใช้ต่อที่อื่นไม่ได้ เพราะ master key อยู่ใน Keystore ของเครื่องเดิม -->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="root" path="." />
+        <exclude domain="file" path="." />
+        <exclude domain="database" path="." />
+        <exclude domain="sharedpref" path="." />
+        <exclude domain="external" path="." />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="root" path="." />
+        <exclude domain="file" path="." />
+        <exclude domain="database" path="." />
+        <exclude domain="sharedpref" path="." />
+        <exclude domain="external" path="." />
+    </device-transfer>
+</data-extraction-rules>
