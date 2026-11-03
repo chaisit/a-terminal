@@ -5,7 +5,7 @@ import dev.aterminal.engine.term.Cell
 
 /**
  * StyleResolver — Cell (number space ของ xterm.js) → สี/flag พร้อมวาด (pure JVM, ทดสอบได้)
- * number space pin แล้ว (evidence/round-9/env/color-encoding.json): mode = bits 24-25 →
+ * number space is pinned: mode = bits 24-25 →
  *   0=default, 1=C16, 2=C256, 3=RGB (ค่าสี = low 24 bits)
  */
 data class RenderStyle(
@@ -88,10 +88,20 @@ object StyleResolver {
      */
     fun resolve(cell: Cell, pal: Palette): RenderStyle {
         val at = cell.attrs and 0x1FF
+        val bold = at and Cell.B_BOLD != 0
         val inverse = at and Cell.B_INVERSE != 0
-        var fg = pal.fgOf(cell.fg, cell.fgMode, pal.defaultFg)
-        var bg = pal.fgOf(cell.bg, cell.bgMode, pal.defaultBg)
-        if (inverse) { val t = fg; fg = bg; bg = t }
+        // ≡ xterm.js canvas _getForegroundColor (device-proven 2026-11-03):
+        // swap ก่อน (inverse) แล้ว brighten เฉพาะ fg ที่วาด เมื่อโหมด C16 idx<8 + bold (drawBoldTextInBrightColors=true)
+        // C256/RGB ไม่แตะ — วัดจริง: [1;38;5;1m ≡ [38;5;1m บน webview
+        val fgMode = if (inverse) cell.bgMode else cell.fgMode
+        val fgIdx0 = if (inverse) cell.bg else cell.fg
+        // เงื่อนไข brighten เดียวกับ xterm: C16 idx<8 + bold เท่านั้น (แยกตัวแปรไว้กันอ่านผิดเป็น "bold = +8 ทุกกรณี")
+        val brighten = bold && fgMode == 1 shl 24 && fgIdx0 in 0..7
+        // default (mode 0) resolves ตาม "ฝั่งที่มาจาก storage": inverse แล้ว fg ที่วาดมาจาก bg slot → defaultBg
+        val fg = pal.fgOf(if (brighten) fgIdx0 + 8 else fgIdx0, fgMode,
+            if (inverse) pal.defaultBg else pal.defaultFg)
+        val bg = pal.fgOf(if (inverse) cell.fg else cell.bg, if (inverse) cell.fgMode else cell.bgMode,
+            if (inverse) pal.defaultFg else pal.defaultBg)
         return RenderStyle(
             fg = fg, bg = bg,
             bold = at and Cell.B_BOLD != 0,

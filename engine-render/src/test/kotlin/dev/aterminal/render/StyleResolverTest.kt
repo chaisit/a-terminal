@@ -51,6 +51,36 @@ class StyleResolverTest {
         assertEquals(true, s.underline); assertEquals(true, s.strike); assertEquals(true, s.overline)
     }
 
+    // round 19 D4: xterm.js drawBoldTextInBrightColors (default true, ≡ device sample 2026-11-03)
+    // bold + ANSI basic (C16 idx<8) → ใช้ palette[idx+8]; C256/RGB ไม่แตะ (fixture 1;38;5;1 = ไม่สว่าง, วัดจริงแล้ว)
+    @Test fun boldBrightensC16Below8() {
+        val s = StyleResolver.resolve(Cell("a", 1, 1, C16, attrs = Cell.B_BOLD), pal)
+        assertEquals(TerminalView.DEFAULT16[9], s.fg)
+    }
+
+    @Test fun boldDoesNotBrightenC16Above7() {
+        val s = StyleResolver.resolve(Cell("a", 1, 9, C16, attrs = Cell.B_BOLD), pal)
+        assertEquals(TerminalView.DEFAULT16[9], s.fg)
+    }
+
+    @Test fun boldDoesNotBrightenC256OrRgb() {
+        assertEquals(TerminalView.DEFAULT16[1], StyleResolver.resolve(Cell("a", 1, 1, C256, attrs = Cell.B_BOLD), pal).fg)
+        assertEquals(0xFF000000.toInt() or 1, StyleResolver.resolve(Cell("a", 1, 1, RGB, attrs = Cell.B_BOLD), pal).fg)
+    }
+
+    @Test fun boldDoesNotBrightenWhenInverseMovesC16ToBackground() {
+        // canvas renderer = swap ก่อน แล้ว brighten เฉพาะ fg ที่วาด — inverse fg C16 idx1 → bg ปกติ (not +8)
+        val s = StyleResolver.resolve(Cell("a", 1, 1, C16, attrs = Cell.B_BOLD or Cell.B_INVERSE), pal)
+        assertEquals(TerminalView.DEFAULT16[1], s.bg)
+        assertEquals(0xFF445566.toInt(), s.fg) // defaultBg ที่ swap เข้า fg: ไม่ใช่ C16 → ไม่ brighten
+    }
+
+    @Test fun boldBrightensInverseMovedColorIntoForeground() {
+        // bg C16 idx1 + inverse → fg ที่วาดคือ idx1 (โหมด C16) → ต้อง +8
+        val s = StyleResolver.resolve(Cell("a", 1, bg = 1, bgMode = C16, attrs = Cell.B_BOLD or Cell.B_INVERSE), pal)
+        assertEquals(TerminalView.DEFAULT16[9], s.fg)
+    }
+
     @Test fun schemeHexParsing() {
         val p = Palette.fromScheme(Scheme(name = "t", foreground = "#fff", background = "#000000"))
         assertEquals(0xFFFFFFFF.toInt(), p.defaultFg) // #fff → 3-digit expand (17×f)

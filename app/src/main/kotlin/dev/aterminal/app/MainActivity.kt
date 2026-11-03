@@ -107,6 +107,8 @@ class MainActivity : ComponentActivity() {
     private lateinit var termContainer: FrameLayout
     private lateinit var statusView: TextView
     private lateinit var tabBar: ComposeView
+    // round 21: keys-bar modifier (CTRL/⇧) — ตัวเดียวทั้ง activity, แปลง input ทุกทางของ active pane
+    private val mods = KeyModifierState()
     private lateinit var keysBar: ExtraKeysBar
     private lateinit var miniBar: MiniKeysBar
     private lateinit var keyboardWatcher: KeyboardWatcher
@@ -256,7 +258,19 @@ class MainActivity : ComponentActivity() {
         termContainer = FrameLayout(this)
         root.addView(termContainer, LinearLayout.LayoutParams(-1, 0, 1f))
 
-        keysBar = ExtraKeysBar(this) { key -> routeKey(key) }
+        // round 21: webview side ของ preempt — push ขอบ anyActive() ให้ทุก pane ที่ยังมี webview
+        // เพื่อ flush composing region ของ xterm (ตัวอักษร Gboard นั่งรอใน composition, ไม่ใช่ commit)
+        // lambda อาจถูกเรียกจาก JAVASCRIPT thread (transform ใน Droid.onInput) = ต้อง runOnUiThread
+        mods.onActiveChange = { active ->
+            runOnUiThread {
+                for (s in tabViews.values.flatMap { it.slots.filterNotNull() }) {
+                    val wv = s.webView
+                    if (wv != null) wv.evaluateJavascript("window.AtermMods && AtermMods.setActive($active);", null)
+                    else if (active) (s.view as? TerminalView)?.flushPreeditRaw() // native: preedit ค้าง = text อดีต → raw (คู่กับ Droid.onFlush)
+                }
+            }
+        }
+        keysBar = ExtraKeysBar(this, mods) { key -> routeKey(key) }
         root.addView(keysBar)
         // C12: landscape + IME เปิด → หดเหลือ mini bar (portrait / IME ปิด = layout เดิม 100%)
         miniBar = MiniKeysBar(this,
@@ -865,6 +879,8 @@ class MainActivity : ComponentActivity() {
         val tv = TerminalView(this).apply {
             setBackgroundColor(0xFF0C0C0C.toInt())
             visibility = View.INVISIBLE
+            preFeedTransform = { mods.transform(it) } // round 21: native IME ก็ผ่าน modifier (funnel เดียวกับ webview onInput)
+            preemptComposition = { mods.anyActive() } // modifier active = tap ถัดไปคือ shortcut → feed ทันที ไม่เข้า preedit
         }
         val s = TerminalSession(tv, null)
         s.controller = SessionController(
@@ -1021,13 +1037,15 @@ class MainActivity : ComponentActivity() {
      */
     private fun routeKey(key: String) {
         val s = activePane() ?: return
+        // round 21: modifier (CTRL/⇧ ค้างหรือ latch) แปลงทุก byte จาก bar — funnel เดียวกับที่ Gboard ใช้
+        val t = mods.transform(key)
         val tv = if (markOn.contains(s)) s.view as? TerminalView else null
         if (tv != null) {
             // native (T7): state = MarkStateMachine ใน view — unmatched = view exit(clear) เอง (onMarkMode ถอด markOn) แล้วเรากลับ path write
-            if (!tv.markKey(key)) s.controller.write(key)
+            if (!tv.markKey(t)) s.controller.write(t)
         } else if (markOn.contains(s)) {
-            s.js("window.Aterm && Aterm.markKey(${JSONObject.quote(key)});")
-        } else s.controller.write(key)
+            s.js("window.Aterm && Aterm.markKey(${JSONObject.quote(t)});")
+        } else s.controller.write(t)
     }
 
     /** grammar/merge/validate อยู่ core ทั้งหมด (D1) — warning ลง log แค่ fail-soft; ตารางถูก push ทุก WebView */
@@ -1361,6 +1379,7 @@ class MainActivity : ComponentActivity() {
 
     /** สลับ container ทั้ง tab ด้วย visibility (ไม่ re-parent — กัน InputConnection หลุดตาม round 4) */
     private fun showActive() {
+        mods.clearLatches() // round 21: latch ของ pane เก่าหมดความหมายเมื่อ layout/scope เปลี่ยน (กัน ✓ ค้างต่าง pane)
         for (id in manager.ids()) {
             val tv = tabViews[id] ?: continue
             tv.container.visibility = if (id == manager.activeId) View.VISIBLE else View.INVISIBLE
@@ -2141,7 +2160,20 @@ class MainActivity : ComponentActivity() {
      */
     inner class SessionBridge(private val session: () -> TerminalSession) {
         @JavascriptInterface
-        fun onInput(text: String) { lruTouch(session()); session().controller.write(text) }
+        // round 21: transform ก่อน write = Gboard تحت CTRL/⇧ ให้ผลเหมือน bar (user flow: กด CTRL ค้าง + ตัวอักษร)
+        fun onInput(text: String) {
+            val r = mods.transform(text) // round 21: transform ก่อน write = Gboard تحت CTRL/⇧ ให้ผลเหมือน bar
+            lruTouch(session()); session().controller.write(r)
+        }
+
+        @JavascriptInterface
+        // round 21: ข้อความที่ค้างใน preedit ตอน modifier ถูกกด = text ที่ user พิมพ์ *ก่อน* modifier
+        // ต้องไป raw (ไม่ transform, ไม่ consume latch) — ไม่งั้น 'j' ที่พิมพ์ค้างไว้จะกลายเป็น Ctrl+J
+        // แล้ว latch ยังโดนกินอีก (วัดจริงบน emulator 2026-11-04)
+        fun onFlush(text: String) {
+            if (text.isEmpty()) return
+            lruTouch(session()); session().controller.write(text)
+        }
 
         @JavascriptInterface
         fun onBinaryBytes(b64: String) {

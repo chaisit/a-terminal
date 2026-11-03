@@ -201,6 +201,12 @@ class TerminalEngineTest {
         assertEquals(Cell.B_UNDERLINE, cell(e, 0, 0).attrs)
     }
 
+    @Test fun overlineOn53Off55() { // SGR 53 sets B_OVERLINE; 55 clears it
+        val e = eng(s = arrayOf("~001b[53mA~001b[55mB"))
+        assertEquals(Cell.B_OVERLINE, cell(e, 0, 0).attrs)
+        assertEquals(0, cell(e, 0, 1).attrs)
+    }
+
     // ================= ED/EL taxonomy (erase-semantics) =================
 
     @Test fun eraseBlankIsCode0WithPenBgOnly() { // ed0_bg44/erase probe: code0 blank w1, fg default, attrs cleared

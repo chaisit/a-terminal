@@ -24,7 +24,8 @@ object RunMerger {
             val c = row[i]
             if (c.width == 0) continue
             val s = StyleResolver.resolve(c, pal)
-            val text = if (c.ch.isEmpty()) " " else c.ch
+            // B_INVISIBLE (SGR 8) = glyph ซ่อนทั่ว body (≡ xterm — bg/width คง, cell ไม่หาย)
+            val text = if (c.ch.isEmpty() || c.attrs and Cell.B_INVISIBLE != 0) " " else c.ch
             if (sb != null && c.width == 1 && s == st && i == next) {
                 sb!!.append(text); end = i + 1; next = end
             } else {

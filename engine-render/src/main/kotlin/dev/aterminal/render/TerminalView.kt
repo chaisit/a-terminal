@@ -29,6 +29,7 @@ import dev.aterminal.core.ResolvedEntry
 import dev.aterminal.core.ResolvedTable
 import dev.aterminal.core.strArg
 import dev.aterminal.engine.TerminalEngine
+import dev.aterminal.engine.term.Cell
 import dev.aterminal.render.input.BufferText
 import dev.aterminal.render.input.Finder
 import dev.aterminal.render.input.GestureAction
@@ -220,19 +221,37 @@ class TerminalView @JvmOverloads constructor(context: Context, attrs: AttributeS
                 }
                 drawRun(canvas, run, x0, top + baselineOffset)
                 if (run.style.overline) {
-                    paintLine.color = run.style.fg
-                    canvas.drawRect(x0, top + 1f, x0 + w, top + 2f, paintLine)
+                    // T04: เส้น ≡ underline จริง = stroke+AA ผ่าน metric ของ font itself
+                    // (bundled FiraCode 50/1950em ≈ 0.94px ที่ fs14 — drawRect ขอบแข็ง 1px
+                    // มองบางกว่า underline ทั้งที่ "เท่ากัน" เพราะ underline ของ glyph renderer
+                    // มี AA spread; stroke+AA ให้ ink profile เดียวกัน — device-proven round 20)
+                    // paintFor (ไม่พึ่ง side-effect ของ drawRun) = metric ตรง typeface ของ run เอง
+                    val t = overlineThicknessPx(paintFor(run.style).underlineThickness, cellH)
+                    // dim ≡ drawRun: faint text ต้องได้ band จางเท่า glyph (underline ก็จางตาม paint)
+                    paintLine.color = if (run.style.dimAlpha) dim(run.style.fg) else run.style.fg
+                    paintLine.strokeWidth = t
+                    canvas.drawLine(x0, top + 1f + t / 2f, x0 + w, top + 1f + t / 2f, paintLine)
                 }
             }
         }
-        // cursor (block outline) — ง่ายและเห็นชัดบน screenshot; refine visual ทีหลัง
+        // cursor — xterm canvas renderer (D5, device-proven 2026-11-03): filled block + glyph ที่วาด
+        // ทับด้วยสี bg ของ cell เอง (bg default → defaultBg ≡ สีพื้นหลังเดิมของ glyph ใต้ block)
         // T1: cursor อยู่ใน live area (abs = baseY+y) — scroll ขึ้นดู history = ไม่เห็น cursor (≡ xterm)
         val curRow = b.baseY + b.y - vpTop
         if (blinkOn && b.x < cols && e.modes.cursorVisible && hasFocus() && curRow in 0 until rows) {
+            val cy = curRow * cellH
+            val cell = b.lines[vpTop + curRow].get(b.x)
+            // block กว้างตาม cell.width ของ glyph ใต้ cursor (wide/CJK = 2 cells ≡ xterm; dummy ครึ่งขวา = 1 cell, ไม่ redraw)
+            val cx = b.x * cellW
+            val cw = if (cell.width > 0) cell.width else 1
             paintCursor.color = palette.cursor
-            val cx = b.x * cellW; val cy = curRow * cellH
-            canvas.drawRect(cx, cy, cx + cellW, cy + cellH, paintCursorOutline)
-            canvas.drawRect(cx, cy + cellH - 2f, cx + cellW, cy + cellH, paintCursor)
+            canvas.drawRect(cx, cy, cx + cw * cellW, cy + cellH, paintCursor)
+            // INVISIBLE = ไม่วาด glyph ใต้ cursor เช่นกัน (≡ xterm; RunMerger ซ่อนที่ body แล้ว — guard นี้กัน path ตรงของ cursor)
+            if (cell.width > 0 && cell.attrs and Cell.B_INVISIBLE == 0 && cell.ch.isNotEmpty() && cell.ch != " ") {
+                val st = StyleResolver.resolve(cell, palette)
+                // dimAlpha off: bg ของ cell ไม่ dim ตาม fg (≡ xterm — alpha ใช้กับ glyph colour เท่านั้น)
+                drawRun(canvas, Run(cell.ch, st.copy(fg = st.bg, bg = palette.cursor, dimAlpha = false), b.x, b.x + cell.width), cx, cy + baselineOffset)
+            }
         }
         // preedit (T5): composition ที่ IME ถือไว้ — underline ที่ cell cursor, ไม่แตะ PTY (≡ G8 "xterm hold")
         if (preeditEnabled && preEdit.active) {
@@ -257,11 +276,10 @@ class TerminalView @JvmOverloads constructor(context: Context, attrs: AttributeS
     }
 
     private val paintBg = Paint()
-    private val paintLine = Paint()
+    private val paintLine = Paint(Paint.ANTI_ALIAS_FLAG) // T04: AA ให้ ink profile ≡ underline (glyph renderer ก็ AA)
     private val paintSelection = Paint()
     private val paintCursor = Paint()
     private val paintScroll = Paint()
-    private val paintCursorOutline = Paint().apply { style = Paint.Style.STROKE; strokeWidth = 1.5f }
 
     private fun drawRun(canvas: Canvas, run: Run, x: Float, baseline: Float) {
         val p = paintFor(run.style)
@@ -346,12 +364,46 @@ class TerminalView @JvmOverloads constructor(context: Context, attrs: AttributeS
         kernel.abort() // T3: ทิ้ง state gesture กลางคร่อม (release ทิ้งได้ — engine/session ใหม่แล้ว)
         mouseEm.reset() // T3: motion dedup ของ engine เดิมใช้ไม่ได้
         preEdit.clear() // T5: composition ค้างผูกกับ session เดิม — feed ลง session ใหม่ไม่ได้
+        rawSentText = ""
         finder.reset() // T6: matches/idx อ้าง abs row ของ engine เดิม
         markExit(true) // T7: mark ค้าง = HUD/markOn ต้องถูกปลด (onMarkMode(false)) + anchor/cur ผูก engine เดิม
         invalidate()
     }
 
-    fun feedText(s: String) { feedBytes(s.toByteArray(Charsets.UTF_8)) }
+    /** host แปลง text ก่อนเป็น bytes (round 21: app ใช้ทำ keys-bar modifier) — default identity, funnel เดียวกับ feedBytes */
+    var preFeedTransform: (String) -> String = { it }
+
+    /** host บอกว่า keys-bar modifier กำลัง active → composition ต้องถูก treat-as-final ทันที (round 21) */
+    var preemptComposition: () -> Boolean = { false }
+
+    /**
+     * Gboard *ไม่ reset* composing word เมื่อเรา feed บางส่วนลง PTY แล้ว — update ถัดไปส่งทั้งคำ
+     * ("j" → flush → "jd") = ตัวอักษรซ้ำ (วัดจริง 2026-11-04: pane "jjjiddj") — ≡ ฝั่ง webview
+     * ที่ xterm dedup ด้วย `_dataAlreadySent`; ที่นี่ = prefix ที่ถูกเขียนลง PTY แล้วของคำปัจจุบัน
+     */
+    private var rawSentText = ""
+
+    /**
+     * preedit ที่ค้างอยู่ *ตอน modifier ถูกกด* = text ที่ user พิมพ์ก่อน modifier → ส่ง raw
+     * (ข้าม preFeedTransform — ไม่งั้น transform จะ rewrite text อดีตด้วย modifier ใหม่ + กิน latch)
+     * ฝั่ง webview ใช้ทางคู่กัน: Droid.onFlush (round 21, วัดจริงบน emulator)
+     */
+    fun flushPreeditRaw() {
+        val pending = preEdit.text
+        if (pending.isEmpty()) return
+        preEdit.clear()
+        rawSentText += pending // invariant: คำเต็มของ IME = rawSentText + preEdit.text
+        feedBytes(pending.toByteArray(Charsets.UTF_8))
+        invalidate()
+    }
+
+    /** ตัด prefix ที่เขียนลง PTY แล้วออกจาก update ของ IME — match ไม่ได้ = คำเปลี่ยน (autocorrect) = ส่งเต็ม + reset */
+    private fun stripWrittenPrefix(text: String): String {
+        if (rawSentText.isEmpty() || !text.startsWith(rawSentText)) { rawSentText = ""; return text }
+        return text.substring(rawSentText.length)
+    }
+
+    fun feedText(s: String) { feedBytes(preFeedTransform(s).toByteArray(Charsets.UTF_8)) }
     fun feedBytes(b: ByteArray) {
         onFeed?.invoke(b)
         // ≡ xterm.js scrollOnUserInput (default true): พิมพ์ = กลับ tail ปล่อย content-lock
@@ -670,17 +722,50 @@ class TerminalView @JvmOverloads constructor(context: Context, attrs: AttributeS
             override fun commitText(text: CharSequence, newCursorPosition: Int): Boolean {
                 if (!preeditEnabled) { feedText(text.toString()); return true } // path เดิม byte-for-byte
                 // T5: t *แทน* composing region — preedit ถูก discard, feed t ครั้งเดียว (≡ G8: onData +1)
-                preEdit.commit(text.toString())?.let { feedText(it) }
+                // t = ทั้งคำ — ตัดส่วนที่ raw-flush/feeding ไปก่อนหน้าแล้วออกก่อน (rawSentText)
+                val rest = stripWrittenPrefix(text.toString())
+                rawSentText = ""
+                preEdit.commit(rest)?.let { feedText(it) }
                 invalidate(); return true
             }
             override fun setComposingText(text: CharSequence, newCursorPosition: Int): Boolean {
+                // round 21: keys-bar modifier กำลัง active = shortcut, ไม่ใช่ composition — Gboard send
+                // letters ผ่าน setComposingText (วัดจริง ATermMods) ถ้าเก็บเข้า preedit = key แรก "หาย"
+                // (flush ทีหลัง = latch หมดอายุ) → treat-as-final: feed ทันทีผ่าน funnel (+transform)
+                if (preeditEnabled && preemptComposition()) {
+                    preEdit.clear()
+                    val t = text.toString()
+                    if (t.isEmpty()) rawSentText = ""
+                    else {
+                        // Gboard ยังส่งทั้งคำ — ส่งเฉพาะส่วนใหม่ใต้ transform, ส่วนเดิมถูกเขียนไปแล้ว (rawSentText)
+                        // ส่งทีละ code point ≡ คีย์จริงกดทีละใต้ modifier (latch = ตัวแรก, hold = ทุกตัว);
+                        // ถ้าส่งทั้งก้อน = multi-char → fail-soft ถอด modifier ทั้งกลุ่ม (วัดจริง: Gboard batch ค้าง)
+                        val rest = stripWrittenPrefix(t)
+                        rawSentText = t
+                        var i = 0
+                        while (i < rest.length) {
+                            val cp = rest.codePointAt(i)
+                            feedText(String(Character.toChars(cp)))
+                            i += Character.charCount(cp)
+                        }
+                    }
+                    invalidate(); return true
+                }
                 if (!preeditEnabled) { if (text.isNotEmpty()) feedText(text.toString()); return true }
                 // T5: เก็บไว้ underline ที่ cursor — ไม่ feed (≡ xterm hold; path เดิม = intermediate bytes รั่ว)
-                preEdit.setComposing(text.toString()); invalidate(); return true
+                // เก็บเฉพาะหางที่ *ยังไม่* ถูก raw-write (finish/commit จะ feed จาก preedit — ห้ามซ้ำส่วนที่ส่งแล้ว)
+                if (rawSentText.isNotEmpty() && text.startsWith(rawSentText)) {
+                    preEdit.setComposing(text.toString().substring(rawSentText.length))
+                } else {
+                    rawSentText = ""
+                    preEdit.setComposing(text.toString())
+                }
+                invalidate(); return true
             }
             override fun finishComposingText(): Boolean {
-                if (preeditEnabled) { // composition จบแบบไม่มี commitText มาแทน — feed สิ่งที่รวมไว้ 1 ครั้ง
+                if (preeditEnabled) { // composition จบแบบไม่มี commitText มาแทน — feed สิ่งที่รวมไว้ 1 ครั้ง (เฉพาะหาง, ส่วน raw-write ไปแล้วไม่อยู่ใน preedit)
                     preEdit.finish()?.let { feedText(it) }
+                    rawSentText = ""
                     invalidate()
                 }
                 return super.finishComposingText()
@@ -774,7 +859,7 @@ class TerminalView @JvmOverloads constructor(context: Context, attrs: AttributeS
         if (preeditEnabled && preEdit.active) {
             when (event.keyCode) {
                 KeyEvent.KEYCODE_DEL -> { preEdit.shrinkBefore(1); invalidate(); return true }
-                KeyEvent.KEYCODE_ESCAPE -> { preEdit.clear(); invalidate() }
+                KeyEvent.KEYCODE_ESCAPE -> { preEdit.clear(); rawSentText = ""; invalidate() }
                 else -> Unit
             }
         }
@@ -854,4 +939,20 @@ class TerminalView @JvmOverloads constructor(context: Context, attrs: AttributeS
         const val DEFAULT_BG = 0xFF0C0C0C.toInt()
         private const val HOLD_MS = 500L // ≡ JS HOLD (terminal.html touchSelect)
     }
+}
+
+/**
+ * Round 20 T04: overline band thickness = the font's own underline metric
+ * (what `isUnderlineText` draws with) when that metric is in a visible range;
+ * outside the range the clamp wins over strict parity (see floor/cap below).
+ * Bounds are specified in OverlineBandTest.
+ */
+internal fun overlineThicknessPx(underlineThickness: Float, cellH: Float): Float {
+    // 2px floor (user-approved 2026-11-03): the bundled font's own underline
+    // metric is 0.94px at our sizes — hairline-thin metrics (broken or real)
+    // must not render a band that vanishes, which was the original complaint
+    val floor = minOf(2f, cellH / 4f)
+    if (!underlineThickness.isFinite() || underlineThickness <= 0f) return floor
+    // cap: even a lying finite metric must not bury the glyphs (quarter cell)
+    return underlineThickness.coerceIn(floor, cellH / 4f)
 }

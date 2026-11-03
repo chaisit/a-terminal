@@ -6,7 +6,11 @@
 <link rel="stylesheet" href="xterm/xterm.css">
 <style>
   html, body { margin:0; padding:0; background:#0c0c0c; height:100%; overflow:hidden; }
-  #term { position:absolute; inset:8px 8px 40px 8px;
+  /* round 20 (D3-b): bottom 40→8 — ค่าเดิมคือที่ว่าง keys-bar ยุค M1 (in-page) ที่ย้ายไป native ตั้งแต่ M3;
+     ทิ้งไว้ = แถบดำไร้เจ้าครอง ~2 แถวใต้ grid (symptom "cell spacing" ของ user)
+     ห้ามเปลี่ยนสี่บรรทัดนี้เป็น shorthand `inset` — shorthand ต้อง Chrome 87+ แต่ gate (MainActivity
+     webviewTooOld) ปล่อย major 86 ผ่าน → shorthand โดนทิ้ง = #term หดตาม content = fixed-point trap เดิม */
+  #term { position:absolute; top:8px; right:8px; bottom:8px; left:8px;
           user-select:none; -webkit-user-select:none; -webkit-touch-callout:none; } /* กัน WebView native long-press menu รบกวน touch selection */
   /* ตัวจริงของ native action mode (Translate/Cut/Copy) คือ helper textarea — ต้องปิดที่มันตรง ๆ
      (programmatic setSelectionRange ของ xterm ยังทำงานใต้ user-select:none) */
@@ -123,12 +127,24 @@ try {
 // retry ถึง ~1s ก่อนยอมรับ fallback 8.4/20 แบบเดิม
 function fit(retry) {
   const cell = (term._core && term._core._renderService && term._core._renderService.dimensions.css.cell) || {};
-  if ((!cell.width || !cell.height) && (retry || 0) < 20) { setTimeout(() => fit((retry || 0) + 1), 50); return; }
-  const cols = Math.max(20, Math.floor((innerWidth - 16) / (cell.width || 8.4)));
+  // round 20 review: กล่อง 0×0 (pane ซ่อน / split ยุบก่อน restore) = ห้าม resize ต่อ —
+  // fallback floor(0/…)+min clamp ส่ง (20,6) เข้า PTY มีชีวิต → vim/tmux redraw ผิดทั้งจอ
+  // ปล่อยเงียบแล้วรอ: GONE→visible ทำให้ WebView viewport เปลี่ยนขนาด → resize event → fit(0) ใหม่อีกรอบ
+  const box = document.getElementById('term');
+  const starved = !cell.width || !cell.height || !box.clientWidth || !box.clientHeight;
+  if (starved && (retry || 0) < 20) { setTimeout(() => fit((retry || 0) + 1), 50); return; }
+  if (!box.clientWidth || !box.clientHeight) return;
+  // round 20 (D3-b): วัดกล่องจริงของ page (div #term ของเราเอง) แทน innerHeight − ค่า magic —
+  // ค่าเก่า (-16/-56 + CSS inset 40px) เป็นเศษยุค M1 ที่ keys bar ยังอยู่ในหน้า (commit f8dbd48,
+  // inset:8 8 40 8 กับดักเดียวกัน) → underreport rows ~1-3 แถว (device CDP: box 314px ได้ 16 แถว ทั้งที่ 17 พอดี)
+  // clientWidth/Height = รวม padding/offset ของ #term เองแล้ว → ไม่ต้อง +16/−56 ซ้ำอีก
+  // ห้ามวัดจาก term.element — ใน 5.5 มันคือ div .xterm ข้างในที่ xterm ตั้ง height = rows×cellH เอง
+  // (วัดกล่องที่ feedback กับผลของตัวเอง = fixed-point ล้น viewport; ตรวจด้วย CDP device)
   // round 7: find bar dock — aterm-find.js กัน top area ไว้ (กัน highlight แถวบนโดน bar บัง)
   const inset = window.__atermInsetTop || 0;
   // fallback 17→20 (round 15-HW): cellH จริงตอนนี้ ≈ 21px (14px × 1.23em × lineHeight 1.2) — ค่าเก่าทำให้ over-estimate rows ตอน metrics-starved
-  const rows = Math.max(6, Math.floor((innerHeight - 56 - inset) / (cell.height || 20)));
+  const cols = Math.max(20, Math.floor(box.clientWidth / (cell.width || 8.4)));
+  const rows = Math.max(6, Math.floor((box.clientHeight - inset) / (cell.height || 20)));
   term.resize(cols, rows);
   if (window.Droid) Droid.onResize(cols, rows);
 }
@@ -157,10 +173,78 @@ if (document.fonts && document.fonts.load) {
 }
 
 // round 7 gate: markMode on = ทุก byte ผ่าน AtermKeys ก่อน (enter=copy, esc=exit, arrows=เลื่อน selection)
-term.onData(data => { if (window.AtermKeys && AtermKeys.consumeIfMarkMode(data)) return; if (window.Droid) Droid.onInput(data); });
+term.onData(data => {
+  if (window.AtermKeys && AtermKeys.consumeIfMarkMode(data)) return;
+  // round 21: AtermMods.pre = dedup commit-ซ้ำทั้งคำของ Gboard (rw) — null/ว่าง = กลืนทั้งก้อน
+  if (window.Droid) { const d = (window.AtermMods && AtermMods.pre) ? AtermMods.pre(data) : data; if (d) Droid.onInput(d); }
+});
 // R4 mouse: report แบบ X10/VT200 ที่ไม่ขอ 1006 ออกทาง onBinary (latin1, coord >127 จะพังผ่าน String bridge)
 // — ส่ง base64 ไป decode ฝั่ง Kotlin; SGR (1006 = tmux/htop) วิ่ง onData เองแล้ว
 term.onBinary(s => { if (window.Droid && Droid.onBinaryBytes) Droid.onBinaryBytes(btoa(s)); });
+
+// round 21: modifier flush (ฝั่ง JS ของ native preemptComposition) — Gboard ส่งตัวอักษรเข้า
+// composing region แล้วนั่งรอ commit ตรงนั้น (วัดจริง: tap 'j' สองครั้งติด = onData 'jj' ก้อนเดียว
+// ตอน commit ถัดไป) ถ้า CTRL/⇧ active แล้วไม่ flush, shortcut จะไปตกที่ commit อื่นแทน
+// flush = dispatch compositionend ปลอมใส่ listener ของ xterm เอง -> _finalizeComposition(true)
+// -> triggerDataEvent(text) -> onData -> Droid.onInput (transform เป็น control byte ฝั่ง Kotlin)
+// dedup ของ text ที่ค้างอยู่ xterm ทำเองผ่าน _dataAlreadySent (Gboard ขยายคำ "j"->"jj" = ส่งเฉพาะ suffix)
+var AtermMods = (function () {
+  var active = false, composing = false, ta = null, termRef = null;
+  // rw = prefix ของคำ Gboard ปัจจุบันที่ *เขียนลง PTY แล้ว* (≡ rawSentText ฝั่ง native) — Gboard
+  // ไม่ reset คำเมื่อเรา flush บางส่วน: commit จริง (space/enter) จะส่ง *ทั้งคำ* ผ่าน onData ซ้ำ
+  // (วัดจริง 2026-11-04: onFlush 'j' + Ctrl+D แล้ว space → onData 'jd ' ทั้งก้อน = duplicate)
+  var rw = '';
+  function flush() {
+    if (!composing || !ta) return;
+    composing = false; // กัน re-enter จาก event ที่ dispatch (handler จริงตั้ง state เอง)
+    ta.dispatchEvent(new CompositionEvent('compositionend', { bubbles: true }));
+  }
+  return {
+    init: function (term) {
+      termRef = term;
+      ta = term.textarea;
+      if (!ta) return;
+      var diverged = function () { if (rw && ta.value.indexOf(rw) !== 0) rw = ''; }; // คำเปลี่ยน (backspace/autocorrect/คำใหม่) = dedup ใช้ไม่ได้
+      ta.addEventListener('compositionstart', function () { composing = true; diverged(); if (active) flush(); });
+      ta.addEventListener('compositionupdate', function () { composing = true; diverged(); if (active) flush(); });
+      ta.addEventListener('compositionend', function () { composing = false; });
+    },
+    // ตัวกรองก่อน Droid.onInput (term.onData เรียกทุกก้อน):
+    //  - ก้อน commit ทั้งคำที่ upต้น = rw (ตัวที่เขียนไปแล้ว) → ตัด prefix ส่งเฉพาะหาง (ว่าง = กลืนทั้งก้อน)
+    //  - data ที่มาใต้ modifier active = ตัวอักษร finalize จริง (xterm finalize = setTimeout(0)
+    //    จึง *ห้าม* วัดด้วย flag รอบ dispatch — วัดจริง: 'd' หลุดมาหลัง inFlush ปิด) → นับเข้า rw
+    //  - อื่น ๆ (paste, plain typing, commit คำใหม่) = reset rw, ส่งตรง — ห้าม dedup paste
+    // ลำดับ strip-ก่อน-add สำคัญ: commit "jd " (rw="jd") ต้อง strip ไม่ใช่ add ซ้ำ
+    pre: function (data) {
+      if (rw && data.indexOf(rw) === 0) {
+        var d = data.slice(rw.length);
+        rw = '';
+        return d.length ? d : null;
+      }
+      if (active) rw += data;
+      else rw = '';
+      return data;
+    },
+    // Kotlin push ผ่าน evaluateJavascript ทุกครั้งที่ anyActive() เปลี่ยนขอบ
+    // active=true: preedit ที่ค้าง = "text ประวัติศาสตร์" ที่พิมพ์ก่อน modifier → ส่ง raw *synchronous*
+    // ผ่าน Droid.onFlush (ไม่เข้า onData/transform เด็ดขาด) แล้ว neutralize finalize ของ xterm ด้วย
+    // _dataAlreadySent (= value เดิม → substring ว่าง → ไม่ส่งซ้ำ) — เคยใช้ bypass-window 50ms
+    // แล้วล้มเหลวบน emulator: user tap CTRL ต่อคีย์ทันที = finalizeArrive <50ms โดนกลืนเป็น text อดีต ("jjd")
+    // press-flush ครั้งที่ N ต้องส่งเฉพาะ *หาง* ของคำ (ta.value ค้างทั้งคำหลัง synthetic finalize) — rw handles
+    setActive: function (v) {
+      active = !!v;
+      if (!active || !ta || !termRef) return;
+      var pending = ta.value;
+      var fresh = (rw && pending.indexOf(rw) === 0) ? pending.slice(rw.length) : pending;
+      rw = pending; // ทุกส่วนของคำปัจจุบันถูกเขียนแล้ว ณ จุดนี้
+      var core = termRef._core, ch = core && core._compositionHelper;
+      if (ch) ch._dataAlreadySent = pending;
+      if (core) core._dataAlreadySent = pending;
+      if (fresh && window.Droid && Droid.onFlush) Droid.onFlush(fresh);
+      flush();
+    }
+  };
+})();
 
 // copyOnSelect (WT global): selection เปลี่ยน -> copy เข้า clipboard ผ่าน native
 if (window.Droid && Droid.copyOnSelect && Droid.copyOnSelect()) {
@@ -358,6 +442,7 @@ window.Aterm = {
 
 if (window.AtermFind) AtermFind.init(term);   // round 7 — init หลัง term.open() เสมอ
 if (window.AtermKeys) AtermKeys.init(term);
+AtermMods.init(term);                          // round 21 — ต้องอยู่หลัง term.open() (term.textarea เกิดตอน open)
 
 term.writeln('A-Terminal — connecting…'); // boot marker: ทุก asset test ต้องเห็นข้อความนี้ก่อน = ไฟล์ใหม่จริง (บทเรียน cache poisoning round 3)
 term.focus();
