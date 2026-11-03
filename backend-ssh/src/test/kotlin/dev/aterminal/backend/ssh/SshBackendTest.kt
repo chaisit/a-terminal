@@ -34,9 +34,11 @@ class SshBackendTest {
         password: String = TestSshServer.PASS,
         verify: ((java.net.SocketAddress, java.security.PublicKey) -> Boolean)? = { _, _ -> true },
         heartbeat: java.time.Duration = SshBackend.KEEPALIVE_INTERVAL,
+        diagnostics: ((String) -> Unit)? = null,
     ) = SshBackend(
         host = "127.0.0.1", port = server.port, user = TestSshServer.USER,
         password = password, hostKeyVerifier = verify, heartbeatInterval = heartbeat,
+        diagnostics = diagnostics,
     ).also { b ->
         b.onData = { out.put(it) }
         backend = b
@@ -64,9 +66,7 @@ class SshBackendTest {
     }
 
     @Test fun `probeHostKey returns key without auth (TOFU two-phase UI flow)`() {
-        val got = runBlocking { SshBackend.probeHostKey("127.0.0.1", server.port) }
-        assertTrue("probe returned no key", got != null)
-        val (algo, key) = got!!
+        val (algo, key) = runBlocking { SshBackend.probeHostKey("127.0.0.1", server.port) }
         val fp = SshBackend.fingerprint(key)
         assertTrue("algo should be an ssh wire name: $algo", algo.startsWith("ssh-") || algo.startsWith("ecdsa-"))
         assertTrue("bad fingerprint: $fp", fp.startsWith("SHA256:") && !fp.endsWith("="))
@@ -102,8 +102,179 @@ class SshBackendTest {
             fail("expected BackendError")
         } catch (e: BackendError) {
             assertEquals(BackendError.Code.HOST_KEY_MISMATCH, e.code)
+            assertTrue("ต้องบอกเหตุชัดเจนเพราะไม่มีด่าน probe แล้ว: ${e.message}", e.message.contains("MITM"))
             assertTrue("host-key mismatch must not auto-retry", !e.retryable)
         }
+    }
+
+    // ── private key จริงจาก ssh-keygen ทุกแบบที่ user น่าจะมี
+
+    private val keyDir: java.io.File by lazy { java.nio.file.Files.createTempDirectory("sshkeys").toFile() }
+
+    private fun keygen(name: String, vararg args: String, passphrase: String = ""): ByteArray {
+        val r = runCatching {
+            ProcessBuilder(listOf("ssh-keygen", "-q", "-N", passphrase, "-C", "test", "-f", "$keyDir/$name") + args)
+                .redirectErrorStream(true).start().waitFor()
+        }.getOrDefault(-1)
+        assumeTrue("ต้องมี ssh-keygen", r == 0)
+        return java.io.File(keyDir, name).readBytes()
+    }
+
+    private fun loginWithKey(key: ByteArray, passphrase: String?) {
+        val b = SshBackend(
+            host = "127.0.0.1", port = server.port, user = TestSshServer.USER,
+            privateKey = { key }, hostKeyVerifier = { _, _ -> true }, keyPassphrase = passphrase,
+        ).also { it.onData = { d -> out.put(d) }; backend = it }
+        runBlocking { b.connect(StartupArgs(null, null, 30, 8)) }
+        assertTrue("key ต้องถูกล้างหลังใช้", key.all { it == 0.toByte() })
+        b.write("ping\r".toByteArray())
+        assertTrue("session ใช้งานไม่ได้", drain(1500).contains("ping"))
+    }
+
+    @Test fun `login with ed25519 without passphrase`() {
+        val k = keygen("ed", "-t", "ed25519")
+        assertEquals(KeyCheck.OK, SshBackend.inspectKey(k))
+        loginWithKey(k, null)
+    }
+
+    @Test fun `login with encrypted ed25519`() {
+        val k = keygen("ed-enc", "-t", "ed25519", passphrase = "correct horse")
+        assertEquals(KeyCheck.NEEDS_PASSPHRASE, SshBackend.inspectKey(k))
+        loginWithKey(k, "correct horse")
+    }
+
+    @Test fun `login with rsa openssh format and encrypted`() {
+        loginWithKey(keygen("rsa", "-t", "rsa", "-b", "2048"), null)
+        loginWithKey(keygen("rsa-enc", "-t", "rsa", "-b", "2048", passphrase = "pw12345"), "pw12345")
+    }
+
+    @Test fun `login with encrypted pem rsa`() {
+        val k = keygen("pem-enc", "-t", "rsa", "-b", "2048", "-m", "PEM", passphrase = "pw12345")
+        assertEquals(KeyCheck.NEEDS_PASSPHRASE, SshBackend.inspectKey(k))
+        loginWithKey(k, "pw12345")
+    }
+
+    @Test fun `login with ecdsa`() {
+        loginWithKey(keygen("ec", "-t", "ecdsa"), null)
+    }
+
+    private fun keyError(key: ByteArray, passphrase: String?): BackendError = try {
+        SshBackend.loadIdentities(key, passphrase)
+        throw AssertionError("expected BackendError")
+    } catch (e: BackendError) {
+        assertTrue("รหัสผิดห้าม auto-retry", !e.retryable)
+        e
+    }
+
+    @Test fun `wrong passphrase is not retryable and not called invalid`() {
+        val k = keygen("ed-wrong", "-t", "ed25519", passphrase = "right-one")
+        assertEquals(BackendError.Code.KEY_PASSPHRASE, keyError(k, "wrong-one").code)
+    }
+
+    @Test fun `missing passphrase asks instead of failing as invalid`() {
+        val k = keygen("ed-none", "-t", "ed25519", passphrase = "right-one")
+        assertEquals(BackendError.Code.KEY_PASSPHRASE, keyError(k, null).code)
+    }
+
+    @Test fun `file that is not a key is invalid`() {
+        val junk = "hello world, this is not a key\n".toByteArray()
+        assertEquals(KeyCheck.INVALID, SshBackend.inspectKey(junk))
+        assertEquals(BackendError.Code.KEY_INVALID, keyError(junk, null).code)
+    }
+
+    @Test fun `public key file is invalid`() {
+        keygen("pub", "-t", "ed25519")
+        assertEquals(KeyCheck.INVALID, SshBackend.inspectKey(java.io.File(keyDir, "pub.pub").readBytes()))
+    }
+
+    // ── Honor หยุด process 37 วินาทีตอนอยู่ background: รอบที่ค้างห้ามยิงรวดเดียวแล้วตัด session ทั้งที่ network ดี
+
+    @Test fun `process stall does not kill a healthy session`() {
+        val closed = java.util.concurrent.CountDownLatch(1)
+        val lines = java.util.concurrent.CopyOnWriteArrayList<String>()
+        val b = newBackend(heartbeat = java.time.Duration.ofMillis(300), diagnostics = { lines.add(it) })
+            .also { it.onClosed = { closed.countDown() } }
+        runBlocking { b.connect(StartupArgs(null, null, 30, 8)) }
+        drain(500)
+        val f = SshBackend::class.java.getDeclaredField("client").apply { isAccessible = true }
+        val c = f.get(b) as org.apache.sshd.client.SshClient
+        c.scheduledExecutorService.submit { Thread.sleep(2500) }
+        assertTrue("session หลุดหลังหยุดชั่วคราว: $lines", !closed.await(4000, TimeUnit.MILLISECONDS))
+        assertTrue("ไม่มีบันทึก stall: $lines", lines.any { it.startsWith("keepalive stall") })
+        b.write("ping\r".toByteArray())
+        assertTrue("session ใช้งานไม่ได้หลัง stall", drain(1500).contains("ping"))
+    }
+
+    @Test fun `silence shorter than the limit keeps the session`() {
+        val closed = java.util.concurrent.CountDownLatch(1)
+        val b = newBackend(heartbeat = java.time.Duration.ofMillis(300)).also { it.onClosed = { closed.countDown() } }
+        runBlocking { b.connect(StartupArgs(null, null, 30, 8)) }
+        drain(500)
+        TestSshServer.deafToHeartbeat = true
+        try {
+            assertTrue("หลุดเร็วเกินไปตอน network เงียบสั้น ๆ", !closed.await(800, TimeUnit.MILLISECONDS))
+        } finally {
+            TestSshServer.deafToHeartbeat = false
+        }
+        assertTrue("ต้องกลับมาปกติเมื่อ reply มา", !closed.await(2500, TimeUnit.MILLISECONDS))
+    }
+
+    // ── server รับ TCP แต่ไม่ตอบ (เครื่องค้าง, proxy, network เพิ่งกลับ): ต้องเป็น error ที่ retry ได้ ไม่ใช่ทำให้ reconnect หยุดถาวร
+
+    @Test(timeout = 40_000) fun `probe of a silent server fails as retryable`() {
+        java.net.ServerSocket(0, 5, java.net.InetAddress.getLoopbackAddress()).use { silent ->
+            val accepted = Thread {
+                runCatching { silent.accept().use { Thread.sleep(35_000) } }
+            }.apply { isDaemon = true; start() }
+            try {
+                runBlocking { SshBackend.probeHostKey("127.0.0.1", silent.localPort) }
+                fail("expected BackendError")
+            } catch (e: BackendError) {
+                assertEquals(BackendError.Code.UNREACHABLE, e.code)
+                assertTrue(e.retryable)
+            } finally {
+                accepted.interrupt()
+            }
+        }
+    }
+
+    // ── เหตุที่ session ปิดต้องถึง log โดยไม่มี host/user ติดไปด้วย
+
+    @Test fun `diagnostics report why the session closed without host or user`() {
+        val lines = java.util.concurrent.CopyOnWriteArrayList<String>()
+        val closed = java.util.concurrent.CountDownLatch(1)
+        val b = newBackend(diagnostics = { lines.add(it) }).also { it.onClosed = { closed.countDown() } }
+        runBlocking { b.connect(StartupArgs(null, null, 30, 8)) }
+        drain()
+        server.stop(true)
+        assertTrue("onClosed ไม่มาหลัง server ตาย", closed.await(5, TimeUnit.SECONDS))
+        val log = lines.joinToString("\n")
+        assertTrue("ไม่มีบรรทัด session closed: $log", log.contains("session closed"))
+        assertTrue("ไม่มีบรรทัด channel closed: $log", log.contains("channel closed exit=null"))
+        assertTrue("host รั่วลง log: $log", !log.contains("127.0.0.1"))
+        assertTrue("user รั่วลง log: $log", !log.contains(TestSshServer.USER))
+    }
+
+    @Test fun `lost keepalive reaches diagnostics`() {
+        val lines = java.util.concurrent.CopyOnWriteArrayList<String>()
+        val closed = java.util.concurrent.CountDownLatch(1)
+        val b = newBackend(heartbeat = java.time.Duration.ofMillis(300), diagnostics = { lines.add(it) })
+            .also { it.onClosed = { closed.countDown() } }
+        runBlocking { b.connect(StartupArgs(null, null, 30, 8)) }
+        drain(500)
+        TestSshServer.deafToHeartbeat = true
+        try {
+            assertTrue(closed.await(4, TimeUnit.SECONDS))
+            assertTrue("ไม่มีเหตุใน log: $lines", lines.any { it.startsWith("keepalive lost") })
+        } finally {
+            TestSshServer.deafToHeartbeat = false
+        }
+    }
+
+    @Test fun `redact removes addresses and known names and truncates`() {
+        val r = SshBackend.redact("failed user1@srv.example /10.1.2.3:22 [fe80::1:2]:22 " + "x".repeat(300), listOf("srv.example", "user1", null))
+        assertTrue(r, !r.contains("srv.example") && !r.contains("user1") && !r.contains("10.1.2.3") && !r.contains("fe80::1:2"))
+        assertTrue("ไม่ถูกตัดความยาว: ${r.length}", r.length <= SshBackend.DIAG_MAX_MESSAGE + 1)
     }
 
     // ── T2 (round 12): keepalive half-open detection — half-open = server เงียบเฉพาะ heartbeat, socket ปกติ

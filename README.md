@@ -29,7 +29,7 @@ Your device must allow installs from your browser or file manager.
 
 ## Security notes
 
-- **Private keys are stored unencrypted** in the app's private storage, protected by Android's app sandbox. Use a dedicated key for this device, and a passphrase where you can.
+- **Private keys are encrypted at rest** (AES-256-GCM under an Android Keystore key) before being written to the app's private storage. Use a dedicated key for this device, and a passphrase where you can.
 - Saved passwords and host key pins use `EncryptedSharedPreferences`, backed by the Android Keystore.
 - App data is excluded from Android backup and device transfer. Use **Export settings.json** to move your profiles, then import your keys again.
 - Auto-paste is off by default. Turning on `autoPasteClipboard` sends every clipboard change to the active shell.
@@ -73,5 +73,5 @@ A-Terminal คือแอป SSH บน Android สไตล์ Windows Termina
 Windows Terminal รองรับ Android 10 ขึ้นไป ดาวน์โหลด APK ได้จากหน้า Releases และควรตรวจ SHA-256 กับ certificate
 ตาม release notes ก่อนติดตั้ง
 
-ข้อควรรู้: private key เก็บแบบไม่เข้ารหัสในพื้นที่ส่วนตัวของแอป จึงควรใช้ key แยกสำหรับเครื่องนี้ และแอปไม่ส่งข้อมูลไป
+ข้อควรรู้: private key ถูกเข้ารหัส (AES-256-GCM ด้วยกุญแจใน Android Keystore) ก่อนเก็บในพื้นที่ส่วนตัวของแอป จึงควรใช้ key แยกสำหรับเครื่องนี้ และแอปไม่ส่งข้อมูลไป
 backup ผู้ใช้จึงต้อง Export settings.json เองเมื่อย้ายเครื่อง

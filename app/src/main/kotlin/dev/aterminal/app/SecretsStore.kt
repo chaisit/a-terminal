@@ -2,17 +2,23 @@ package dev.aterminal.app
 
 import android.content.Context
 import android.content.SharedPreferences
+import android.security.keystore.KeyGenParameterSpec
+import android.security.keystore.KeyProperties
 import android.util.Log
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 import java.io.File
+import java.security.KeyStore
 import javax.crypto.AEADBadTagException
+import javax.crypto.KeyGenerator
+import javax.crypto.SecretKey
 
 /**
  * ความลับทั้งหมดของ app อยู่ที่นี่ — settings.json ไม่เก็บ credential/pinned key (แนวเดียวกับ WT)
  *  - password: keyed by profile guid
  *  - host key pin (TOFU): keyed by "host:port" -> "algo SHA256:fingerprint"
- *  - private key: ไฟล์จริงใต้ filesDir/keys/<alias> chmod 0600 (settings.json อ้าง alias)
+ *  - private key: ciphertext ใต้ filesDir/keys/<alias> (ดู KeyVault) กุญแจอยู่ใน Android Keystore, settings.json อ้าง alias
+ *  - passphrase ของ private key ที่ user เลือกจำ: keyed by alias
  */
 class SecretsStore(context: Context, private val onReset: () -> Unit = {}) {
 
@@ -52,24 +58,46 @@ class SecretsStore(context: Context, private val onReset: () -> Unit = {}) {
         prefs.edit().putString("pin:$host:$port", value).apply()
     }
 
-    fun importKey(alias: String, content: ByteArray): File {
-        val dir = File(appContext.filesDir, "keys").apply { mkdirs() }
-        val f = File(dir, alias)
-        f.writeBytes(content)
-        f.setReadable(false, false).also { f.setReadable(true, true) }
-        f.setWritable(false, false).also { f.setWritable(true, true) }
-        return f
+    /** กุญแจแยกจาก master key ของ secrets.xml: การ reset ไฟล์นั้นต้องไม่ทำให้ private key หาย */
+    private val vault by lazy { KeyVault(File(appContext.filesDir, "keys")) { keystoreKey() } }
+
+    private fun keystoreKey(): SecretKey {
+        val ks = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+        (ks.getKey(VAULT_KEY, null) as? SecretKey)?.let { return it }
+        return KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore").apply {
+            init(
+                KeyGenParameterSpec.Builder(VAULT_KEY, KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT)
+                    .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+                    .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+                    .setKeySize(256)
+                    .build()
+            )
+        }.generateKey()
     }
 
-    fun keyFile(alias: String): File? {
-        val f = File(File(appContext.filesDir, "keys"), alias)
-        return if (f.isFile) f else null
+    fun importKey(alias: String, content: ByteArray) = vault.store(alias, content)
+    fun hasKey(alias: String): Boolean = vault.has(alias)
+
+    /** Keystore ทำงานช้าได้: เรียก off-main ผู้เรียกล้าง array หลังใช้ */
+    fun loadKey(alias: String): ByteArray = vault.load(alias)
+
+    internal fun migrateKeys(): KeyVault.Migration = vault.migrate()
+
+    fun deleteKey(alias: String) {
+        vault.delete(alias)
+        setKeyPassphrase(alias, null)
+    }
+
+    fun keyPassphrase(alias: String): String? = prefs.getString("kp:$alias", null)
+    fun setKeyPassphrase(alias: String, value: String?) {
+        prefs.edit().apply { if (value == null) remove("kp:$alias") else putString("kp:$alias", value) }.apply()
     }
 
     // fingerprint อยู่กับ SshBackend (ต้อง marshal SSH blob — อย่า duplicate สูตร hash ที่อื่น)
 
     companion object {
         private const val PREFS = "secrets"
+        private const val VAULT_KEY = "aterminal_ssh_keys"
 
         /** เฉพาะ bad tag = ถอดรหัสไม่ได้แน่ ความผิดพลาดอื่นของ Keystore อาจชั่วคราว ห้ามลบ */
         internal fun isUndecryptable(e: Throwable): Boolean =

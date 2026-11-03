@@ -69,4 +69,7 @@ class TerminalSession(view: View, webView: WebView? = view as? WebView) {
      * (ไม่เคย connect เลย = ไม่มีอะไรให้ reconnect; set ครั้งเดียวที่ onSessionStatus CONNECTED)
      */
     var everConnected = false
+
+    /** dial ที่ user สั่งเอง: ต่อไม่ได้ให้แจ้ง error แล้วหยุด ไม่เข้า backoff จนกว่าจะเคย CONNECTED ในรอบนี้ */
+    var manualDial = false
 }

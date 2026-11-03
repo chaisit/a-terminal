@@ -1,6 +1,8 @@
 package dev.aterminal.app
 
 import android.app.Activity
+import dev.aterminal.backend.ssh.KeyCheck
+import dev.aterminal.backend.ssh.SshBackend
 import android.app.AlertDialog
 import android.content.Intent
 import android.text.InputType
@@ -37,7 +39,8 @@ class ConnectUi(private val act: MainActivity) {
             }
             (p.name ?: p.guid ?: "?") + tail
         } + listOf("➕ Add profile…", "✏️ Edit profile…", "🗑 Delete profile…",
-            "⬇ Export settings.json", "⬆ Import settings.json…", "📄 Open source licenses")
+            "⬇ Export settings.json", "⬆ Import settings.json…", "📄 Open source licenses", "🔍 Copy connection log",
+            "🔋 Keep CPU awake while connected: " + if (act.settings.keepCpuAwake) "On" else "Off")
         AlertDialog.Builder(act)
             .setTitle("New session")
             .setItems(titles.toTypedArray()) { d, which ->
@@ -48,6 +51,8 @@ class ConnectUi(private val act: MainActivity) {
                     which == profiles.size + 3 -> { d.dismiss(); act.settingsUi.export() }
                     which == profiles.size + 4 -> { d.dismiss(); act.settingsUi.import() }
                     which == profiles.size + 5 -> { d.dismiss(); showLicenses() }
+                    which == profiles.size + 6 -> { d.dismiss(); act.copyConnectionLog() }
+                    which == profiles.size + 7 -> { d.dismiss(); act.toggleKeepCpuAwake() }
                     else -> { d.dismiss(); act.connectProfile(profiles[which]) }
                 }
             }
@@ -231,12 +236,40 @@ class ConnectUi(private val act: MainActivity) {
         try {
             val bytes = act.contentResolver.openInputStream(uri)?.use { it.readBytes() } ?: return
             if (bytes.size > 128 * 1024) { toast("file too large (not a key?)"); return }
+            if (SshBackend.inspectKey(bytes) == KeyCheck.INVALID) {
+                bytes.fill(0)
+                toast("This file is not a supported private key")
+                return
+            }
             act.secrets.importKey(alias, bytes)
+            bytes.fill(0)
             importTarget?.invoke(alias) ?: run { pendingKeyAlias = alias }
             toast("Imported as $alias")
         } catch (e: Exception) {
             toast("import failed: ${e.message}")
         }
+    }
+
+    // ---------- passphrase ของ private key (ตอน connect) ----------
+    fun promptPassphrase(onOk: (passphrase: String, remember: Boolean) -> Unit) {
+        val pad = (16 * act.resources.displayMetrics.density).toInt()
+        val box = LinearLayout(act).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(pad, pad, pad, 0)
+        }
+        val pw = EditText(act).apply {
+            hint = "passphrase"
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+        }
+        // ไม่จำ = auto-reconnect ทำไม่ได้ จึงเปิดไว้เป็นค่าเริ่มต้นเหมือน password
+        val remember = CheckBox(act).apply { text = "Remember (encrypted). Needed for auto-reconnect."; isChecked = true }
+        box.addView(pw); box.addView(remember)
+        AlertDialog.Builder(act)
+            .setTitle("Private key passphrase")
+            .setView(box)
+            .setPositiveButton("Connect") { _, _ -> onOk(pw.text.toString(), remember.isChecked) }
+            .setNegativeButton("Cancel", null)
+            .showGuarded(act)
     }
 
     // ---------- password prompt (ตอน connect) ----------
@@ -284,6 +317,27 @@ class ConnectUi(private val act: MainActivity) {
             // fail-safe = Reject (เช่นเดียวกับ cancel)
             if (dlg == null && !cont.isCompleted) cont.resumeWith(Result.success(false))
         }
+
+    // ---------- re-pin host key (host ที่ pin แล้ว key เปลี่ยน เช่น server ลงใหม่) ----------
+    /**
+     * เรียกบน main thread ผ่าน coroutine — ลายเซ็นเดียวกับ tofuDialog (fail-safe = Reject)
+     * ข้อความมาจาก RepromptPolicy.warningMessage (มี test): ผู้ใช้ต้องเห็น fingerprint เก่า+ใหม่ก่อน — ห้ามเปลี่ยน pin เงียบ
+     */
+    suspend fun rePinDialog(
+        host: String, port: Int,
+        oldAlgo: String, oldFingerprint: String,
+        newAlgo: String, newFingerprint: String,
+    ): Boolean = kotlinx.coroutines.suspendCancellableCoroutine { cont ->
+        val dlg = AlertDialog.Builder(act)
+            .setTitle("Host key has changed")
+            .setMessage(RepromptPolicy.warningMessage(host, port, oldAlgo, oldFingerprint, newAlgo, newFingerprint))
+            .setCancelable(false)
+            .setPositiveButton("Accept new key") { _, _ -> if (!cont.isCompleted) cont.resumeWith(Result.success(true)) }
+            .setNegativeButton("Reject") { _, _ -> if (!cont.isCompleted) cont.resumeWith(Result.success(false)) }
+            .setOnCancelListener { if (!cont.isCompleted) cont.resumeWith(Result.success(false)) }
+            .showGuarded(act)
+        if (dlg == null && !cont.isCompleted) cont.resumeWith(Result.success(false))
+    }
 
     fun toast(msg: String) {
         // R5: toast บน activity ตาย = noise (ไม่ crash แต่ไร้ประโยชน์) — ทิ้ง

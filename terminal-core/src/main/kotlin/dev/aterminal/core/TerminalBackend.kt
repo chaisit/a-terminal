@@ -49,7 +49,7 @@ class BackendError(
     override val message: String,
     override val cause: Throwable? = null,
 ) : Exception(message, cause) {
-    enum class Code { UNREACHABLE, AUTH_FAILED, CHANNEL_FAILED, LOCAL_SERVICE_MISSING, UNSUPPORTED, HOST_KEY_MISMATCH }
+    enum class Code { UNREACHABLE, AUTH_FAILED, CHANNEL_FAILED, LOCAL_SERVICE_MISSING, UNSUPPORTED, HOST_KEY_MISMATCH, KEY_PASSPHRASE, KEY_INVALID }
 
     /** retryable — แนวเดียวกับ REA envelope (code + retryable); HOST_KEY_MISMATCH ต้องไม่ retry อัตโนมัติ (MITM guard) */
     val retryable: Boolean

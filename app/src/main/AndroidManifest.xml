@@ -5,6 +5,12 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
+    <!-- session อยู่ต่อเมื่อจอปิด/สลับแอป: ไม่มี service ระบบบล็อก network หลัง background 5 วินาที -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
     <!-- termux backend: ต้อง declare เพื่อ query ว่า Termux ติดตั้งอยู่ไหม (Android 11+ package visibility) -->
     <queries>
         <package android:name="com.termux" />
@@ -29,17 +35,28 @@
              resizeableActivity=true : split-screen terminal = use case จริง (≡ WT panes)
              (T3 round 13: targetSdk 35 แล้ว — overturn ตัดสิน round 10; edge-to-edge บน API35 = bars โผล่จริง,
               root padding อิง insets ใน KeyboardWatcher — ห้ามย้าย listener ออกไปจากตัวนั้น)
+             ครบทุกชนิด (พบจริงบน Honor: ค่าระบบเปลี่ยนระหว่างจอปิด แล้ว session หลุดตอนกลับมา, ManifestGuardTest กันไว้)
              ที่เหลือ (grid/engine/renderer re-fit) อยู่ใน MainActivity.onConfigurationChanged — ห้ามให้ recreate กลับมา -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
             android:resizeableActivity="true"
-            android:configChanges="orientation|screenSize|keyboardHidden|keyboard|smallestScreenSize|screenLayout|density|layoutDirection"
+            android:configChanges="mcc|mnc|locale|touchscreen|keyboard|keyboardHidden|navigation|screenLayout|fontScale|uiMode|orientation|density|screenSize|smallestScreenSize|layoutDirection|colorMode|grammaticalGender|fontWeightAdjustment"
             android:windowSoftInputMode="adjustResize">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- specialUse ไม่ใช่ dataSync: Android 15 จำกัด dataSync 6 ชม./24 ชม. แต่ terminal เปิดนานกว่านั้นได้ -->
+        <service
+            android:name=".SessionKeepAliveService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Keeps user-opened interactive SSH terminal sessions connected while the screen is off or another app is in use." />
+        </service>
     </application>
 </manifest>

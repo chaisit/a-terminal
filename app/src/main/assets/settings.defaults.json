@@ -48,5 +48,6 @@
   ],
   "copyOnSelect": false,
   "trimPaste": true,
-  "autoPasteClipboard": false
+  "autoPasteClipboard": false,
+  "keepCpuAwake": false
 }

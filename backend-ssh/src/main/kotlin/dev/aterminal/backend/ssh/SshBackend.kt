@@ -12,12 +12,52 @@ import org.apache.sshd.client.session.ClientSession
 import org.apache.sshd.common.channel.PtyChannelConfiguration
 import org.apache.sshd.common.channel.StreamingChannel
 import org.apache.sshd.common.io.IoInputStream
-import org.apache.sshd.common.keyprovider.FileKeyPairProvider
+import org.apache.sshd.common.keyprovider.KeyIdentityProvider
+import org.apache.sshd.common.session.Session
+import org.apache.sshd.common.session.SessionListener
+import org.apache.sshd.common.NamedResource
+import org.apache.sshd.common.SshConstants
+import org.apache.sshd.common.kex.KexState
+import org.apache.sshd.common.config.keys.FilePasswordProvider
+import org.apache.sshd.common.util.security.SecurityUtils
 import org.apache.sshd.common.util.buffer.ByteArrayBuffer
 import org.apache.sshd.core.CoreModuleProperties
-import java.nio.file.Paths
+import java.io.ByteArrayInputStream
+import java.security.KeyPair
 import java.time.Duration
 import java.util.concurrent.atomic.AtomicBoolean
+
+/**
+ * ตัดสินจากเวลาจริงระหว่างรอบ: ช่วงห่างเกิน 2 เท่าแปลว่า process ไม่ได้ทำงาน (ถูกหยุดหรือเครื่องหลับ)
+ * รอบที่หายไปตอนนั้นไม่ใช่หลักฐานว่า network ตาย จึงเริ่มนับใหม่ ใช้นาฬิกา wall เพราะเดินต่อทั้งตอนถูกหยุดและตอนหลับ
+ */
+internal class HeartbeatMonitor(private val intervalMs: Long, private val missLimit: Int, startMs: Long) {
+    enum class Action { SEND, SEND_AFTER_STALL, LOST }
+
+    @Volatile var misses = 0
+        private set
+    private var lastTickMs = startMs
+
+    fun lastGapMs(nowMs: Long): Long = nowMs - lastTickMs
+
+    fun onTick(nowMs: Long): Action {
+        val gap = nowMs - lastTickMs
+        lastTickMs = nowMs
+        if (gap > intervalMs * 2) {
+            misses = 1
+            return Action.SEND_AFTER_STALL
+        }
+        if (misses >= missLimit) return Action.LOST
+        misses++
+        return Action.SEND
+    }
+
+    fun onReply() {
+        misses = 0
+    }
+}
+
+enum class KeyCheck { OK, NEEDS_PASSPHRASE, INVALID }
 
 /**
  * SshBackend — TerminalBackend เหนือ SSH shell channel (PTY) ผ่าน Apache MINA SSHD (Apache-2.0)
@@ -30,11 +70,15 @@ class SshBackend(
     private val host: String,
     private val port: Int = 22,
     private val user: String? = null,
-    private val privateKeyPath: String? = null,
+    // ส่งเป็น function ไม่ใช่ path: key เก็บแบบเข้ารหัส ถอดเฉพาะตอนใช้ แล้ว backend ล้าง array ทิ้ง
+    private val privateKey: (() -> ByteArray)? = null,
     private val password: String? = null,
     private val hostKeyVerifier: ((address: java.net.SocketAddress, key: java.security.PublicKey) -> Boolean)? = null,
     // T2 (round 12): heartbeat interval — ค่า default ใช้จริงบน production; test สั้นลงได้ (JVM lab)
     private val heartbeatInterval: java.time.Duration = KEEPALIVE_INTERVAL,
+    // เหตุที่ session ปิด สำหรับ log ที่ user คัดลอกเองได้: ข้อความผ่าน redact แล้ว ไม่มี host/user/address
+    private val diagnostics: ((String) -> Unit)? = null,
+    private val keyPassphrase: String? = null,
 ) : TerminalBackend {
 
     override val type = "ssh"
@@ -45,6 +89,15 @@ class SshBackend(
     private var session: ClientSession? = null
     private var shell: ChannelShell? = null
     private val closed = AtomicBoolean(false)
+
+    private fun diag(msg: String) {
+        diagnostics?.let { runCatching { it(msg) } }
+    }
+
+    private fun describe(t: Throwable): String =
+        generateSequence(t) { it.cause }.take(3)
+            .joinToString(" <- ") { "${it.javaClass.name}: ${redact(it.message, listOf(host, user))}" }
+
     // resize off-main (StrictMode) — serial = window-change ไม่สลับลำดับเองมั่ว ๆ
     private val resizeExec = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
         Thread(r, "aterm-ssh-resize").apply { isDaemon = true }
@@ -83,10 +136,48 @@ class SshBackend(
                     val f = sh0.asyncIn.writeBuffer(ByteArrayBuffer(data))
                     if (!f.await()) break
                 } catch (t: Throwable) {
+                    if (!closed.get()) diag("stdin write failed ${describe(t)}")
                     break // channel ตาย = ปกติ — closeFutureListener บอกสถานะจริงเอง
                 }
             }
         }.apply { name = "aterm-ssh-stdin"; isDaemon = true; start() }
+    }
+
+    private var keepalive: java.util.concurrent.Future<*>? = null
+
+    /** fixed delay ไม่ใช่ fixed rate: รอบที่ค้างระหว่าง process ถูกหยุดต้องหายไป ไม่ยิงตามทีหลัง */
+    private fun startKeepalive(c: SshClient, s: ClientSession) {
+        val monitor = HeartbeatMonitor(heartbeatInterval.toMillis(), KEEPALIVE_MISS_LIMIT, System.currentTimeMillis())
+        keepalive = c.scheduledExecutorService.scheduleWithFixedDelay({
+            try {
+                if (s.kexState == KexState.DONE && !closed.get()) {
+                    val now = System.currentTimeMillis()
+                    val gap = monitor.lastGapMs(now)
+                    when (monitor.onTick(now)) {
+                        HeartbeatMonitor.Action.LOST -> {
+                            diag("keepalive lost misses=$KEEPALIVE_MISS_LIMIT")
+                            s.close(true) // channel close listener รายงาน Error(retryable) ต่อเอง
+                        }
+                        HeartbeatMonitor.Action.SEND_AFTER_STALL -> {
+                            diag("keepalive stall gap=${gap}ms")
+                            sendKeepalive(s, monitor)
+                        }
+                        HeartbeatMonitor.Action.SEND -> sendKeepalive(s, monitor)
+                    }
+                }
+            } catch (t: Throwable) {
+                // ห้ามปล่อย throw: scheduler จะเลิกเรียก task นี้เงียบ ๆ แล้ว session ที่ตายจะไม่มีใครตรวจเจอ
+                diag("keepalive failed ${describe(t)}")
+            }
+        }, heartbeatInterval.toMillis(), heartbeatInterval.toMillis(), java.util.concurrent.TimeUnit.MILLISECONDS)
+    }
+
+    private fun sendKeepalive(s: ClientSession, monitor: HeartbeatMonitor) {
+        val buf = s.createBuffer(SshConstants.SSH_MSG_GLOBAL_REQUEST, KEEPALIVE_REQUEST.length + Byte.SIZE_BITS)
+        buf.putString(KEEPALIVE_REQUEST)
+        buf.putBoolean(true)
+        // reply ทุกชนิดรวม failure/unimplemented แปลว่า server ยังอยู่
+        s.request(buf, KEEPALIVE_REQUEST) { _, _ -> monitor.onReply() }
     }
 
     private fun startPump(out: IoInputStream) {
@@ -104,7 +195,8 @@ class SshBackend(
                         buf.clear()
                     }
                 }
-            } catch (_: Throwable) {
+            } catch (t: Throwable) {
+                if (!closed.get()) diag("pump failed ${describe(t)}")
             } // channel ตายกลาง read = ปกติ — อย่า propagate, อย่า toast
         }.apply { name = "aterm-ssh-pump"; isDaemon = true; start() }
     }
@@ -114,19 +206,26 @@ class SshBackend(
 
     override suspend fun connect(startup: StartupArgs) = withContext(Dispatchers.IO) {
         val c = SshClient.setUpDefaultClient()
-        // T2 (round 12) — keepalive/close-detection, FACT จาก sources jar 2.14.0 (ห้ามจำ — ตรวจแล้วทีละตัว):
-        // • heartbeat **มีในตัว** (ClientConnectionService.startHeartBeat) แต่ default ปิด:
-        //   HEARTBEAT_INTERVAL=ZERO → ตั้ง 15s; wantReply = (NO_REPLY_MAX > 0);
-        //   ส่งครั้งที่ (MAX+1) โดยไม่มี reply → SshException → session.exceptionCaught → close → closeFutureListener → onClosed
-        //   (ตรวจ reply ทุกชนิดรวม UNIMPLEMENTED/REQUEST_FAILURE = live — callback reset outstanding)
-        //   ⇒ half-open (peer เงียบ, ไม่ส่ง FIN/RST) ตายภายใน ~2×interval; reply ยัง reset IDLE_TIMEOUT ให้ด้วย
-        //      (sources: requestSuccess/requestFailure/handleUnimplemented → resetIdleTimeout —
-        //       channel DATA **ไม่** reset: ถ้าไม่มี heartbeat, session idle 10 นาทีโดน IDLE_TIMEOUT ฆ่าเอง!)
-        // • SOCKET_KEEPALIVE = SO_KEEPALIVE ระดับ kernel (default false) — เส้นสำรองระยะยาว
-        CoreModuleProperties.HEARTBEAT_INTERVAL.set(c, heartbeatInterval)
-        CoreModuleProperties.HEARTBEAT_REQUEST.set(c, KEEPALIVE_REQUEST)
-        CoreModuleProperties.HEARTBEAT_NO_REPLY_MAX.set(c, KEEPALIVE_MISS_LIMIT)
+        // ไม่ใช้ heartbeat ในตัวของ MINA (HEARTBEAT_INTERVAL) เพราะ scheduleAtFixedRate ยิงรอบที่ค้างรวดเดียวหลัง process ถูกหยุด
+        // แล้วตัด session ทั้งที่ network ดี (พบจริงบน Honor: หยุด 37 วินาทีตอนอยู่ background) ดู startKeepalive
+        // ปิด IDLE_TIMEOUT เพราะ startKeepalive ตรวจการเชื่อมต่อตายแทนแล้ว และถ้าหยุดเกิน 10 นาที timeout จะตัดทันทีตอนกลับมา
+        CoreModuleProperties.IDLE_TIMEOUT.set(c, Duration.ZERO)
+        // SO_KEEPALIVE ระดับ kernel เป็นเส้นสำรองระยะยาว
         CoreModuleProperties.SOCKET_KEEPALIVE.set(c, true)
+        // default ของ MINA เสนอทุก key ใน ~/.ssh ให้ server: ต้องเสนอเฉพาะ key ที่ profile ระบุเท่านั้น
+        c.keyIdentityProvider = KeyIdentityProvider.EMPTY_KEYS_PROVIDER
+        // exception จริงอยู่ใน listener นี้เท่านั้น: หลังจากนี้ onClosed เหลือแค่ "channel ปิด" ไม่บอกว่าเพราะอะไร
+        c.addSessionListener(object : SessionListener {
+            override fun sessionException(session: Session, t: Throwable) {
+                diag("session exception ${describe(t)}")
+            }
+            override fun sessionDisconnect(session: Session, reason: Int, msg: String?, language: String?, initiator: Boolean) {
+                diag("session disconnect code=$reason byClient=$initiator msg=${redact(msg, listOf(host, user))}")
+            }
+            override fun sessionClosed(session: Session) {
+                diag("session closed")
+            }
+        })
         c.start()
         client = c
         hostKeyRejected.set(false)
@@ -147,11 +246,7 @@ class SshBackend(
                 .verify(TIMEOUT).session
             session = s
 
-            if (privateKeyPath != null) {
-                FileKeyPairProvider(Paths.get(privateKeyPath))
-                    .loadKeys(null)
-                    .forEach { s.addPublicKeyIdentity(it) }
-            }
+            if (privateKey != null) loadIdentities(privateKey.invoke(), keyPassphrase).forEach { s.addPublicKeyIdentity(it) }
             if (password != null) s.addPasswordIdentity(password)
             s.auth().verify(TIMEOUT)
 
@@ -168,6 +263,7 @@ class SshBackend(
             sh.isRedirectErrorStream = true // stderr = stream เดียวตามพฤติกรรม terminal
             sh.open().verify(TIMEOUT)
             shell = sh
+            startKeepalive(c, s)
             startPump(sh.asyncOut)
             startStdinWriter() // R4-fix2: ขา app→server แบบ serialized (single outstanding writeBuffer)
 
@@ -178,14 +274,22 @@ class SshBackend(
                     // javap ยืนยัน ClientChannel.getExitStatus(): Integer, null = ไม่เคยถูกส่ง
                     //  ⇒ exit ≠ null = user พิมพ์ exit / shell ตายฝั่ง server → Normal (T3 ห้าม redial)
                     //  ⇒ exit = null = transport ขาดจริง (half-open/crash) → Error(retryable) ให้ redial
+                    keepalive?.cancel(false)
                     val exit = runCatching { sh.exitStatus }.getOrNull()
+                    diag("channel closed exit=$exit")
                     onClosed(if (exit != null) CloseReason.Normal
                     else CloseReason.Error("ssh channel closed", retryable = true))
                 }
             }
+        } catch (e: BackendError) {
+            closeQuietly()
+            throw e
         } catch (e: Exception) {
             closeQuietly()
             val code = classifyConnectFailure(hostKeyRejected.get(), e)
+            if (code == BackendError.Code.HOST_KEY_MISMATCH && verifierFailure == null) {
+                throw BackendError(code, "host key changed for $host:$port, possible MITM. Connection refused.", e)
+            }
             throw BackendError(
                 code,
                 "ssh connect failed: $host:$port" + (verifierFailure?.let { " (host-key verifier threw: $it)" } ?: ""),
@@ -228,13 +332,57 @@ class SshBackend(
     /** fingerprint แบบ `ssh-keygen -lf` (SHA256 base64 no-padding) — ให้ TOFU UI ใช้ */
     companion object {
         internal val TIMEOUT = Duration.ofSeconds(20)
+        private val PROBE_KEX_TIMEOUT = Duration.ofSeconds(10)
 
-        // T2 (round 12) — heartbeat: เปิด using library mechanism (ดู comment ใน connect)
-        // 15s × NO_REPLY_MAX=1 → half-open ตรวจจับ+ปิดตัวเองภายใน ~2×15s = 30s (gate T2)
+        internal const val DIAG_MAX_MESSAGE = 160
+        private val IPV4 = Regex("""\b\d{1,3}(\.\d{1,3}){3}\b""")
+        private val IPV6 = Regex("""\b[0-9a-fA-F]{0,4}(:[0-9a-fA-F]{0,4}){2,7}\b""")
+
+        private class PassphraseRequested : java.io.IOException()
+
+        private fun parse(bytes: ByteArray, passwords: FilePasswordProvider): List<KeyPair> =
+            SecurityUtils.loadKeyPairIdentities(null, NamedResource.ofName("key"), ByteArrayInputStream(bytes), passwords)
+                ?.toList().orEmpty()
+
+        /** ตรวจแบบไม่ถอดรหัส: ใช้ตอน import และก่อนถาม passphrase ไม่ล้าง bytes ให้ ผู้เรียกเป็นเจ้าของ */
+        fun inspectKey(bytes: ByteArray): KeyCheck = try {
+            if (parse(bytes) { _, _, _ -> throw PassphraseRequested() }.isEmpty()) KeyCheck.INVALID else KeyCheck.OK
+        } catch (t: Throwable) {
+            if (generateSequence(t) { it.cause }.take(8).any { it is PassphraseRequested }) KeyCheck.NEEDS_PASSPHRASE
+            else KeyCheck.INVALID
+        }
+
+        /** ล้าง bytes เสมอ MINA ไม่บอกชนิดความผิดที่ชัดเจนเมื่อ passphrase ผิด จึงตัดสินจากว่าไฟล์เข้ารหัสอยู่ไหม */
+        internal fun loadIdentities(bytes: ByteArray, passphrase: String?): List<KeyPair> {
+            try {
+                val check = inspectKey(bytes)
+                if (check == KeyCheck.INVALID) throw BackendError(BackendError.Code.KEY_INVALID, "not a supported private key")
+                if (check == KeyCheck.NEEDS_PASSPHRASE && passphrase.isNullOrEmpty()) {
+                    throw BackendError(BackendError.Code.KEY_PASSPHRASE, "key passphrase required")
+                }
+                return try {
+                    parse(bytes, FilePasswordProvider.of(passphrase)).ifEmpty { throw java.io.IOException("no keys") }
+                } catch (e: Exception) {
+                    throw BackendError(BackendError.Code.KEY_PASSPHRASE, "wrong key passphrase or unsupported encryption", e)
+                }
+            } finally {
+                bytes.fill(0)
+            }
+        }
+
+        /** ข้อความจาก library/server อาจมีชื่อเครื่อง, user หรือ address ติดมา: ตัดออกก่อนเข้า log */
+        internal fun redact(message: String?, known: List<String?>): String {
+            var out = message ?: return ""
+            for (k in known) if (!k.isNullOrEmpty()) out = out.replace(k, "<redacted>")
+            out = IPV6.replace(IPV4.replace(out, "<ip>"), "<ip>")
+            return if (out.length > DIAG_MAX_MESSAGE) out.take(DIAG_MAX_MESSAGE) + "…" else out
+        }
+
+        // ตัดเมื่อไม่มี reply เกินเพดานนี้: network ตายจริงรู้ใน ~75 วินาที (15s x 5)
+        // เดิม 1 ครั้ง (~30 วินาที) ตัด session ที่แค่ Wi-Fi พักชั่วคราวทิ้ง
         internal val KEEPALIVE_INTERVAL = Duration.ofSeconds(15)
-        internal const val KEEPALIVE_REQUEST = "keepalive@openssh.com" // OpenSSH ตอบ success; server อื่นได้
-        // UNIMPLEMENTED/FAILURE reply = live ทั้งนั้น (ClientConnectionService callback นับทุก reply)
-        internal const val KEEPALIVE_MISS_LIMIT = 1
+        internal const val KEEPALIVE_REQUEST = "keepalive@openssh.com"
+        internal const val KEEPALIVE_MISS_LIMIT = 4
         /** R4-fix2: เพดาน backlog ขาเข้า (paste ยักษ์ + server window stall = main รอได้ไม่เกิน 2s) */
         const val STDIN_MAX_QUEUED = 8 * 1024 * 1024
         private const val STDIN_BACKPRESSURE_TIMEOUT_NS = 2_000_000_000L
@@ -265,23 +413,27 @@ class SshBackend(
             org.apache.sshd.common.config.keys.PublicKeyEntry.toString(key).substringBefore(' ')
 
         /**
-         * TOFU probe: TCP+kex อย่างเดียว (ไม่ auth, ไม่เปิด channel) แล้วเก็บ host key จาก kex
+         * TOFU probe: TCP+kex อย่างเดียว ไม่ส่ง user หรือ auth request เลย (เดิมลอง auth แล้ว sshd บันทึก Invalid user,
+         * ให้ penalty ต่อ IP และ fail2ban แบนได้) ใช้เฉพาะ host ที่ยังไม่มี pin แล้วเก็บ host key จาก kex
          * — ให้ UI prompt บน main thread ได้ โดยไม่ต้องบล็อก MINA ioThread กลาง connect จริง
          * (บทเรียนจาก device: verifier ที่ latch-รอ dialog = ioThread ถูก interrupt = InterruptedException)
          * throw BackendError(UNREACHABLE) เมื่อติดต่อ server ไม่ได้
          */
-        suspend fun probeHostKey(host: String, port: Int): Pair<String, java.security.PublicKey>? =
+        suspend fun probeHostKey(host: String, port: Int): Pair<String, java.security.PublicKey> =
             withContext(Dispatchers.IO) {
-                val c = SshClient.setUpDefaultClient().also { it.start() }
+                val c = SshClient.setUpDefaultClient().also {
+                    it.keyIdentityProvider = KeyIdentityProvider.EMPTY_KEYS_PROVIDER
+                    it.start()
+                }
                 try {
                     var captured: java.security.PublicKey? = null
                     c.setServerKeyVerifier { _, _, key -> captured = key; true }
-                    val s = c.connect("aterm-probe", host, port).verify(TIMEOUT).session
-                    // connect().verify() กลับหลัง version exchange — kex (ที่เรียก verifier) อาจยังไม่จบ
-                    // dummy auth (ไม่มี identity) บังคับให้ kex/SshMsgNewKeys จบก่อน แล้ว auth ค่อย fail — ทิ้งผลได้
-                    runCatching { s.auth().verify(Duration.ofSeconds(5)) }
+                    val s = c.connect("probe", host, port).verify(TIMEOUT).session
+                    // connect().verify() กลับหลัง version exchange: WAIT_AUTH = kex จบแล้ว verifier ถูกเรียกแล้ว
+                    runCatching { s.waitFor(listOf(ClientSession.ClientSessionEvent.WAIT_AUTH), PROBE_KEX_TIMEOUT) }
                     runCatching { s.close(true) }
-                    captured?.let { sshKeyType(it) to it }
+                    // รับ TCP แต่ไม่จบ kex = ติดต่อไม่ได้เหมือนกัน (server ค้าง, proxy, network เพิ่งกลับ) ต้อง retry ได้
+                    captured?.let { sshKeyType(it) to it } ?: throw java.io.IOException("no host key: key exchange did not finish")
                 } catch (e: Exception) {
                     throw BackendError(BackendError.Code.UNREACHABLE, "cannot reach $host:$port for host-key probe", e)
                 } finally {
@@ -325,6 +477,7 @@ class SshBackend(
     }
 
     private fun closeQuietly() {
+        keepalive?.cancel(false)
         resizeExec.shutdownNow()
         stdinThread?.interrupt() // ปลุก writer ที่ค้างใน take() (daemon ก็หยุดเองไม่ได้ถ้าไม่มี poison)
         runCatching { shell?.close(true) }

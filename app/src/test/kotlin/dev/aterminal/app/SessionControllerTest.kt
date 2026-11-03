@@ -85,6 +85,33 @@ class SessionControllerTest {
         } finally { Dispatchers.resetMain() }
     }
 
+    // retry ที่ยังต่อไม่ได้ห้ามล้างจอ: user ต้องอ่านข้อความล่าสุดได้ระหว่าง network ล่ม
+
+    @Test fun failedConnect_neverRunsBeforeFirstOutput() = runTest {
+        Dispatchers.setMain(StandardTestDispatcher(testScheduler))
+        try {
+            var cleared = 0
+            val ctrl = controller(this)
+            ctrl.connect(FakeBackend(failConnect = BackendError(BackendError.Code.UNREACHABLE, "down")), startup) { cleared++ }
+            advanceUntilIdle()
+            assertEquals(0, cleared)
+        } finally { Dispatchers.resetMain() }
+    }
+
+    @Test fun firstOutput_runsHookOnceBeforeBytes() = runTest {
+        Dispatchers.setMain(StandardTestDispatcher(testScheduler))
+        try {
+            val order = mutableListOf<String>()
+            val ctrl = controller(this) { if (it.contains("Aterm.onBytes")) order.add("bytes") }
+            val be = FakeBackend()
+            ctrl.connect(be, startup) { order.add("clear") }
+            advanceUntilIdle()
+            be.onData("more".toByteArray())
+            advanceUntilIdle()
+            assertEquals(listOf("clear", "bytes", "bytes"), order)
+        } finally { Dispatchers.resetMain() }
+    }
+
     @Test fun remoteClose_nullsBackend_andWriteIsSilent() = runTest {
         Dispatchers.setMain(StandardTestDispatcher(testScheduler))
         try {

@@ -25,6 +25,9 @@ data class Settings(
     // non-WT extension (round 10 R6, user เลือก "toggle ใน settings"): clip เปลี่ยนจาก app อื่น = auto-paste เข้า pane
     // ค่าเดิม true = พฤติกรรมเดิมทุกตัวอักษร; false = ปิด auto-paste (pasteNow มือยังใช้ได้ปกติ)
     val autoPasteClipboard: Boolean = false,
+    // non-WT extension: Windows Terminal ไม่มีแนวคิดนี้ เป็นเรื่องของ Android เท่านั้น
+    // true = ถือ partial wake lock ตลอดที่มี session กัน CPU หลับจน server ตัด แลกกับแบตเตอรี่
+    val keepCpuAwake: Boolean = false,
     // non-WT extension (round 11 T5): native preedit hold (≡ xterm composition — G8) vs path เดิม feed-ทันที
     // ค่าเดิม true = preedit thật; false = emergency rollback กลับ native IME path เก่า byte-for-byte (เฉพาะ engine=native)
     val preeditEnabled: Boolean = true,

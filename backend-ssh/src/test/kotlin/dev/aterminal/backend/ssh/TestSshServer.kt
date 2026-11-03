@@ -68,6 +68,8 @@ object TestSshServer {
             Files.createTempDirectory("aterminal-test-hostkey").resolve("hostkey.ser")
         )
         server.setPasswordAuthenticator { u, p, _ -> u == USER && p == PASS }
+        // ยอมรับทุก key แต่ MINA ยังตรวจลายเซ็นจริง: พิสูจน์ได้ว่าโหลด private key ถูกต้อง
+        server.setPublickeyAuthenticator { u, _, _ -> u == USER }
         // shell request → ShellFactory (ไม่ใช่ CommandFactory — ตัวนั้นคือ exec)
         server.shellFactory = org.apache.sshd.server.shell.ShellFactory { _ -> EchoShell() }
         server.commandFactory = CommandFactory { _, _ -> EchoShell() }

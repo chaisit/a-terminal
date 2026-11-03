@@ -105,6 +105,11 @@ class SettingsCompatTest {
     }
 
     // 0.2.0: default = false (ไฟล์ที่ไม่มี field นี้ก็ปิด) — เปิดได้ด้วยการตั้งค่าเอง
+    @Test fun `keepCpuAwake defaults false and parses true`() {
+        assertFalse(SettingsLoader.parse("""{"profiles":{"list":[]}}""").keepCpuAwake)
+        assertTrue(SettingsLoader.parse("""{"keepCpuAwake":true,"profiles":{"list":[]}}""").keepCpuAwake)
+    }
+
     @Test fun `autoPasteClipboard defaults false and overrides to true`() {
         assertFalse(SettingsLoader.parse("""{}""").autoPasteClipboard)
         assertTrue(SettingsLoader.parse("""{"autoPasteClipboard": true}""").autoPasteClipboard)

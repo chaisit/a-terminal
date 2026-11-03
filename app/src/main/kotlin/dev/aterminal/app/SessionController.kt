@@ -56,12 +56,15 @@ class SessionController(
     private val pending = BoundedByteQueue()
     private val draining = AtomicBoolean(false)
     private var drainJob: Job? = null
+    private var beforeFirstOutput: (() -> Unit)? = null
 
     @Volatile private var closingByUs = false
 
-    fun connect(backend: TerminalBackend, startup: StartupArgs) {
+    /** beforeFirstOutput: ล้างจอตอน output แรกของ session นี้ ไม่ใช่ตอนเริ่ม dial — retry ที่ยังต่อไม่ได้ต้องไม่ลบข้อความเดิม */
+    fun connect(backend: TerminalBackend, startup: StartupArgs, beforeFirstOutput: (() -> Unit)? = null) {
         close()
         closingByUs = false
+        this.beforeFirstOutput = beforeFirstOutput
         lastError = null // T3: กัน stale decision (retryable ของรอบก่อน)
         lastCloseReason = null
         activeBackend = backend
@@ -184,6 +187,7 @@ class SessionController(
                 // R3 (F-1): sink/engine throw = ห้ามพังทั้ง drain loop/app — map ≡ write-fail pattern
                 // (null backend ก่อน setState แล้วปิด loop; draining=false เพื่อให้ connect ครั้งใหม่ drain ต่อได้)
                 try {
+                    beforeFirstOutput?.let { beforeFirstOutput = null; it() }
                     if (sink != null) sink(bytes)
                     else evalJs("window.Aterm && Aterm.onBytes('${java.util.Base64.getEncoder().encodeToString(bytes)}');")
                 } catch (t: Throwable) {
@@ -202,6 +206,7 @@ class SessionController(
     }
 
     fun close() {
+        beforeFirstOutput = null
         drainJob?.cancel()
         resizeTrail?.cancel() // R9: trailing resize ที่รออยู่ห้ามยิงข้าม session (backend ถูก close แล้ว)
         draining.set(false)

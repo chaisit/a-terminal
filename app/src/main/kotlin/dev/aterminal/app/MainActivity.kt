@@ -32,6 +32,7 @@ import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.setViewTreeLifecycleOwner
 import androidx.savedstate.setViewTreeSavedStateRegistryOwner
 import androidx.compose.ui.platform.ComposeView
+import dev.aterminal.backend.ssh.KeyCheck
 import dev.aterminal.backend.ssh.SshBackend
 import dev.aterminal.backend.termux.TermuxBackend
 import dev.aterminal.core.BackendError
@@ -73,6 +74,8 @@ import org.json.JSONObject
  *  - limitation เท่าเดิม: session เป็น activity-scoped (rotate/process-death = session หาย)
  */
 class MainActivity : ComponentActivity() {
+    private var connectionDiagnostics: ConnectionDiagnostics? = null
+    private var lastConfig: android.content.res.Configuration? = null
 
     internal lateinit var secrets: SecretsStore
     internal lateinit var connectUi: ConnectUi
@@ -136,10 +139,20 @@ class MainActivity : ComponentActivity() {
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         CrashLog.install(this) // ก่อนทุกอย่าง: crash ระหว่าง onCreate ก็ต้องมี report
+        ConnectionLog.init(this)
+        ConnectionLog.d("activity onCreate pid=${android.os.Process.myPid()} restored=${savedInstanceState != null} task=$taskId")
+        connectionDiagnostics = ConnectionDiagnostics(this).also { it.start() }
+        SessionKeepAliveService.onDisconnectAll = { disconnectAllSessions() }
+        lastConfig = android.content.res.Configuration(resources.configuration)
         super.onCreate(savedInstanceState)
         secrets = SecretsStore(this) {
             // เรียกจาก thread ไหนก็ได้ (lazy) และ TOFU จะถามใหม่เหมือนเชื่อมต่อครั้งแรก
-            runOnUiThread { Toast.makeText(this, "Saved passwords and host keys could not be read and were reset", Toast.LENGTH_LONG).show() }
+            runOnUiThread { Toast.makeText(this, "Saved passwords, passphrases and host keys could not be read and were reset", Toast.LENGTH_LONG).show() }
+        }
+        lifecycleScope.launch(Dispatchers.IO) {
+            runCatching { secrets.migrateKeys() }
+                .onSuccess { if (it.migrated + it.failed > 0) ConnectionLog.d("key migration migrated=${it.migrated} failed=${it.failed}") }
+                .onFailure { ConnectionLog.d("key migration failed ${it.javaClass.name}") }
         }
         SshBackend.setHomeFolder(filesDir) // MINA บน Android ไม่มี user.home — ต้อง set ก่อน client แรก
         connectUi = ConnectUi(this)
@@ -212,7 +225,9 @@ class MainActivity : ComponentActivity() {
             setOnClickListener {
                 val s = activePane()
                 val p = s?.profile
-                if (s != null && p != null && (s.error != null || s.controller.state == SessionController.State.DISCONNECTED)) {
+                // IDLE + มี profile = กด Disconnect all ไว้ แตะแล้วต่อ pane เดิม ไม่เปิด tab ใหม่
+                if (s != null && p != null && (s.error != null || s.controller.state == SessionController.State.DISCONNECTED ||
+                        s.controller.state == SessionController.State.IDLE)) {
                     // T3: tap ระหว่าง countdown = "retry ตอนนี้" — ยกเลิกคิวกัน dial ซ้ำสองรอบ
                     cancelReconnect(s)
                     startConnect(s, p) // tap = retry บน pane เดิม (ไม่เปิดใหม่)
@@ -323,6 +338,50 @@ class MainActivity : ComponentActivity() {
         super.onActionModeStarted(mode)
     }
 
+    override fun onStart() {
+        super.onStart()
+        ConnectionLog.d("activity onStart sessions=${connectedPaneCount()}")
+        connectionDiagnostics?.onForeground()
+        syncKeepAlive() // service ที่เริ่มจาก background ไม่ได้ (เช่น reconnect) เริ่มตรงนี้
+    }
+
+    override fun onResume() {
+        super.onResume()
+        ConnectionLog.d("activity onResume")
+    }
+
+    override fun onPause() {
+        ConnectionLog.d("activity onPause finishing=$isFinishing")
+        super.onPause()
+    }
+
+    override fun onStop() {
+        ConnectionLog.d("activity onStop finishing=$isFinishing config=$isChangingConfigurations sessions=${connectedPaneCount()}")
+        connectionDiagnostics?.onBackground()
+        super.onStop()
+    }
+
+    override fun onUserLeaveHint() {
+        ConnectionLog.d("activity onUserLeaveHint")
+        super.onUserLeaveHint()
+    }
+
+    override fun onTrimMemory(level: Int) {
+        ConnectionLog.d("activity onTrimMemory level=$level")
+        super.onTrimMemory(level)
+    }
+
+    private fun connectedPaneCount(): Int = tabViews.values.sumOf { tv ->
+        tv.slots.count { it?.controller?.state == SessionController.State.CONNECTED }
+    }
+
+    /** menu "Copy connection log": ให้ user ส่งเองเมื่อ session หลุด บนเครื่องที่ไม่มี adb */
+    internal fun copyConnectionLog() {
+        ConnectionLog.dump { text ->
+            runOnUiThread { if (text.isEmpty()) toast("Connection log is empty") else copyTextToClipboard(text) }
+        }
+    }
+
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
         if (hasFocus) activePane()?.let { focusAndReveal(it) }
@@ -331,6 +390,8 @@ class MainActivity : ComponentActivity() {
     // configChanges ใน Manifest เก็บ rotation ไว้ที่ activity (session ไม่หาย — C11) จึง hookตรงนี้ได้อิสระ
     override fun onConfigurationChanged(newConfig: android.content.res.Configuration) {
         super.onConfigurationChanged(newConfig)
+        ConnectionLog.d("activity onConfigurationChanged diff=0x${Integer.toHexString(lastConfig?.diff(newConfig) ?: 0)}")
+        lastConfig = android.content.res.Configuration(newConfig)
         forceFullKeys = false   // rotate = reset การ force (mini bar ตัดสินใหม่ตาม orientation ใหม่)
         applyKeysBars()
         // R9 foldable: activity ไม่ recreate (manifest declare ครบ) → ไม่มี onCreate มา re-configure ให้
@@ -1330,9 +1391,60 @@ class MainActivity : ComponentActivity() {
         window.decorView.keepScreenOn = tabViews.values.any { tv ->
             tv.slots.any { it?.controller?.state == SessionController.State.CONNECTED }
         }
+        syncKeepAlive()
+    }
+
+    private fun syncKeepAlive() {
+        val panes = tabViews.values.flatMap { it.slots.filterNotNull() }.filter { it.profile?.type != "echo" }
+        val state = { w: SessionController.State -> panes.count { it.controller.state == w } }
+        val decision = KeepAlivePolicy.decide(
+            connected = state(SessionController.State.CONNECTED),
+            connecting = state(SessionController.State.CONNECTING),
+            // ไม่ดู reconnectJob: ระหว่าง probe มันเป็น null ทั้งที่ยัง reconnect อยู่ ถ้า service หยุดตรงนั้นจะเริ่มใหม่จาก background ไม่ได้
+            reconnecting = panes.count {
+                it.controller.state == SessionController.State.DISCONNECTED && it.error == null &&
+                    !it.reconnect.stoppedByUser && isRetryable(it)
+            },
+            keepCpuAwake = settings.keepCpuAwake,
+        )
+        SessionKeepAliveService.sync(this, decision, lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.STARTED))
+        if (decision.run) askNotificationPermissionOnce()
+    }
+
+    /** ไม่อนุญาตก็ยังใช้งานได้ แค่ไม่เห็น notification จึงถามครั้งเดียวแล้วไม่รบกวนอีก */
+    private fun askNotificationPermissionOnce() {
+        if (android.os.Build.VERSION.SDK_INT < 33) return
+        if (!lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED)) return
+        val prefs = getSharedPreferences("ui", Context.MODE_PRIVATE)
+        if (prefs.getBoolean("asked_notifications", false)) return
+        prefs.edit().putBoolean("asked_notifications", true).apply()
+        requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), REQ_NOTIFICATIONS)
+    }
+
+    internal fun toggleKeepCpuAwake() {
+        settings = settings.copy(keepCpuAwake = !settings.keepCpuAwake)
+        persistSettings()
+        syncKeepAlive()
+        toast(if (settings.keepCpuAwake) "CPU stays awake while connected. Uses more battery." else "CPU may sleep while the screen is off")
+    }
+
+    /** ปุ่มบน notification: ปิดทุก pane แต่คง tab ไว้ ให้แตะ status bar เพื่อต่อใหม่ได้ */
+    private fun disconnectAllSessions() {
+        for (tv in tabViews.values) for (p in tv.slots) p?.let {
+            cancelReconnect(it)
+            it.controller.close()
+            it.everConnected = false // user ตัดเอง: เปิดแอปครั้งหน้าห้ามต่อกลับอัตโนมัติ
+        }
+        scheduleSnapshotWrite()
+        refreshTabs()
+        renderActiveStatus()
     }
 
     private fun onSessionStatus(s: TerminalSession, state: SessionController.State, message: String?) {
+        // ไม่ใช้ message: มี host ติดมา ใช้เฉพาะ code/ชนิดของเหตุ
+        val close = s.controller.lastCloseReason
+        ConnectionLog.d("pane ${paneTag(s)} $state code=${s.controller.lastError?.code} " +
+            "close=${when (close) { is CloseReason.Normal -> "normal"; is CloseReason.Error -> "error"; null -> null }} retryable=${(close as? CloseReason.Error)?.retryable}")
         if (state == SessionController.State.CONNECTED || state == SessionController.State.CONNECTING) s.error = null
         if (state == SessionController.State.IDLE) s.error = null
         // T3 (round 12): auto-reconnect hook — ตัดสินจาก state transition เท่านั้น
@@ -1340,17 +1452,33 @@ class MainActivity : ComponentActivity() {
             SessionController.State.CONNECTED -> {
                 cancelReconnect(s)
                 s.reconnect.noteConnected() // ปลดทั้ง backoff count และ user-stop
+                s.manualDial = false
                 s.dialGen++ // T4: ปิดยุครุ่นเดิม — dial in-flight ที่เหลือ (ถ้ามี) ตายเงียบ
                 if (!s.everConnected) { s.everConnected = true; scheduleSnapshotWrite() } // T4 restore: ผู้มีสิทธิ์ reconnect เกิดแล้ว
                 Log.d("AtermRC", "connected gen=${s.dialGen} (policy reset)")
             }
             SessionController.State.IDLE -> cancelReconnect(s) // close()/retry ของ user = คิวเก่ายกเลิก
-            SessionController.State.DISCONNECTED -> maybeScheduleReconnect(s)
+            SessionController.State.DISCONNECTED -> {
+                // จำผิดไว้ = ถามใหม่ไม่ได้อีกเลย จึงลืมเฉพาะกรณีนี้ แตะ status bar แล้วจะถามใหม่
+                if (s.controller.lastError?.code == BackendError.Code.KEY_PASSPHRASE) s.profile?.keyAlias?.let { secrets.setKeyPassphrase(it, null) }
+                // re-pin (round 16): mismatch จาก manual dial = ผู้ใช้ยืนรอคำตอบอยู่ — เสนอยืนยัน fingerprint ใหม่
+                // (manualDial = false ทันที = ผล manual ถูก consume แล้ว, DISCONNECTED ซ้ำจะไม่ stack dialog)
+                if (RepromptPolicy.shouldPrompt(s.controller.lastError?.code, s.manualDial)) {
+                    s.manualDial = false
+                    offerReprompt(s)
+                }
+                maybeScheduleReconnect(s)
+            }
             SessionController.State.CONNECTING -> Unit
         }
         refreshTabs()
         if (s === activePane()) renderActiveStatus()
     }
+
+    private fun isRetryable(s: TerminalSession): Boolean = s.controller.lastError?.retryable
+        ?: (s.controller.lastCloseReason as? CloseReason.Error)?.retryable ?: false
+
+    private fun paneTag(s: TerminalSession): String = Integer.toHexString(System.identityHashCode(s))
 
     /** T3: ยกเลิก countdown ที่ค้าง (tab/pane จะตาย หรือ user ยึดการควบคุมเอง) */
     private fun cancelReconnect(s: TerminalSession) {
@@ -1368,8 +1496,13 @@ class MainActivity : ComponentActivity() {
     private fun maybeScheduleReconnect(s: TerminalSession) {
         val p = s.profile ?: return
         if (s.error != null) return // connect-flow error (TOFU refused ฯลฯ) = ไม่เข้า state machine
-        val retryable = s.controller.lastError?.retryable
-            ?: (s.controller.lastCloseReason as? CloseReason.Error)?.retryable ?: false
+        val retryable = isRetryable(s)
+        s.controller.lastError?.takeIf { retryable && s.manualDial }?.let { e ->
+            // เหมือนตอนยังมี probe: ต่อเองแล้วไม่ได้ = แจ้งแล้วหยุด ไม่ retry ไปเรื่อยจน notification ค้าง
+            s.manualDial = false
+            renderError(s, e.message)
+            return
+        }
         val delayMs = s.reconnect.nextDelayMs(retryable)
         cancelReconnect(s) // คิวเก่า (ถ้ามี) ต้องตายก่อน — กัน dial ซ้อน
         if (delayMs == null) return // fatal หรือ user-stop → banner แดงเดิม (+ "auto off")
@@ -1443,34 +1576,70 @@ class MainActivity : ComponentActivity() {
                     renderError(s, "No saved password. Tap the status bar to enter it.")
                     return
                 }
-                if (saved != null) startSession(s, p, saved, null, autoRetry, myGen)
+                if (saved != null) startSession(s, p, saved, null, null, autoRetry, myGen)
                 else connectUi.promptPassword(p) { pw, remember ->
                     if (remember) p.guid?.let { secrets.setPassword(it, pw) }
-                    startSession(s, p, pw, null, autoRetry, myGen)
+                    startSession(s, p, pw, null, null, autoRetry, myGen)
                 }
             }
             "key" -> {
-                val f = p.keyAlias?.let { secrets.keyFile(it) }
-                if (f == null && !interactive) {
+                val alias = p.keyAlias?.takeIf { secrets.hasKey(it) }
+                if (alias == null && !interactive) {
                     renderError(s, "Key not found on this device. Tap the status bar to import it.")
                     return
                 }
-                if (f == null) {
-                    // key หาย/ยังไม่ import → import ทันที แล้วผูก alias กับ profile
-                    connectUi.pickKey { alias ->
-                        val p2 = p.copy(keyAlias = alias)
-                        saveProfile(p2)
-                        startSession(s, p2, null, secrets.keyFile(alias)!!.absolutePath, autoRetry, myGen)
-                    }
+                if (alias == null) {
+                    importKeyThenConnect(s, p, autoRetry, myGen) // key หาย/ยังไม่ import
                     return
                 }
-                startSession(s, p, null, f.absolutePath, autoRetry, myGen)
+                connectWithKey(s, p, alias, interactive, autoRetry, myGen)
             }
-            else -> startSession(s, p, null, null, autoRetry, myGen)   // echo/none
+            else -> startSession(s, p, null, null, null, autoRetry, myGen)   // echo/none
         }
     }
 
-    private fun startSession(s: TerminalSession, p: Profile, password: String?, keyPath: String?, autoRetry: Boolean = false, gen: Int = -1) {
+    private fun importKeyThenConnect(s: TerminalSession, p: Profile, autoRetry: Boolean, gen: Int) {
+        connectUi.pickKey { alias ->
+            val p2 = p.copy(keyAlias = alias)
+            saveProfile(p2)
+            connectWithKey(s, p2, alias, interactive = true, autoRetry, gen)
+        }
+    }
+
+    /** ตรวจไฟล์ก่อนต่อ เพื่อถาม passphrase ก่อนเปิด connection และไม่ให้ไฟล์เสียเข้า backoff */
+    private fun connectWithKey(s: TerminalSession, p: Profile, alias: String, interactive: Boolean, autoRetry: Boolean, gen: Int) {
+        lifecycleScope.launch {
+            val check = withContext(Dispatchers.IO) {
+                runCatching { secrets.loadKey(alias).let { b -> SshBackend.inspectKey(b).also { b.fill(0) } } }
+                    .onFailure { ConnectionLog.d("key load failed ${it.javaClass.name}") }
+                    .getOrDefault(KeyCheck.INVALID)
+            }
+            if (gen != s.dialGen) return@launch
+            val source: () -> ByteArray = { secrets.loadKey(alias) }
+            when (check) {
+                KeyCheck.OK -> startSession(s, p, null, source, null, autoRetry, gen)
+                KeyCheck.INVALID ->
+                    if (interactive) { toast("This key can't be read here. Import it again."); importKeyThenConnect(s, p, autoRetry, gen) }
+                    else renderError(s, "This key can't be read on this device. Tap the status bar to import it again.")
+                KeyCheck.NEEDS_PASSPHRASE -> {
+                    val saved = secrets.keyPassphrase(alias)
+                    when {
+                        saved != null -> startSession(s, p, null, source, saved, autoRetry, gen)
+                        !interactive -> renderError(s, "Key passphrase needed. Tap the status bar to enter it.")
+                        else -> connectUi.promptPassphrase { pw, remember ->
+                            if (remember) secrets.setKeyPassphrase(alias, pw)
+                            startSession(s, p, null, source, pw, autoRetry, gen)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private fun startSession(
+        s: TerminalSession, p: Profile, password: String?, privateKey: (() -> ByteArray)?, keyPassphrase: String?,
+        autoRetry: Boolean = false, gen: Int = -1,
+    ) {
         if (p.type == "termux" && packageManager.getLaunchIntentForPackage("com.termux") == null) {
             renderError(s, "Termux not installed — type=termux needs Termux + sshd on 127.0.0.1:8022")
             return
@@ -1485,65 +1654,112 @@ class MainActivity : ComponentActivity() {
                 port = p.port
             }
         }
-        // TOFU two-phase: probe (IO, ไม่ block ไรก็ตาม) -> UI decide (main) -> real connect (verifier = pin-compare ถูก ๆ)
-        // — ห้ามให้ dialog รออยู่บน MINA ioThread (เคยเป็น InterruptedException บน device)
+        // TOFU two-phase เฉพาะ host ที่ยังไม่มี pin: probe (IO) -> UI decide (main) -> real connect
+        // ห้ามให้ dialog รออยู่บน MINA ioThread (เคยเป็น InterruptedException บน device)
+        // มี pin แล้วไม่ probe: verifier ตรวจตอน connect จริงอยู่แล้ว (ไม่ตรง = HOST_KEY_MISMATCH ไม่ retry)
         lifecycleScope.launch {
-            val probed = runCatching { withContext(Dispatchers.IO) { SshBackend.probeHostKey(host, port) } }
-            val got = probed.getOrNull()
-            if (probed.isFailure) {
-                // T3: dial จาก countdown และ network ยังไม่กลับ = ต่อ countdown (banner เหลือง) ไม่ใช่ error จบวง
-                if (autoRetry) {
-                    if (gen == s.dialGen) maybeScheduleReconnect(s) // superseded = ปล่อยให้คิวรุ่นใหม่ดูแลเอง
-                    else Log.d("AtermRC", "stale dial dropped (probe fail) gen=$gen cur=${s.dialGen}")
-                    return@launch
-                }
-                renderError(s, probed.exceptionOrNull()?.message ?: "host-key probe failed")
-                return@launch
-            }
-            if (got == null) { renderError(s, "server sent no host key during kex"); return@launch }
-            val (algo, key) = got
-            val fp = SshBackend.fingerprint(key)
-            if (gen != s.dialGen) { // T4: กัน dialog/แดง ของ dial ที่ถูกรุ่นใหม่แทนแล้ว
-                Log.d("AtermRC", "stale dial dropped (post-probe) gen=$gen cur=${s.dialGen}"); return@launch
-            }
-            val pin = secrets.hostPin(host, port)
-            when {
-                pin == "$algo $fp" -> Unit // pinned already — proceed silently
-                pin != null -> {
-                    renderError(s, "HOST KEY CHANGED for $host:$port — possible MITM, connection refused")
-                    return@launch
-                }
-                else -> {
-                    val ok = withContext(Dispatchers.Main) { connectUi.tofuDialog(host, port, algo, fp) }
-                    if (!ok) {
-                        s.error = "connection refused (host key not accepted)"
-                        refreshTabs(); renderActiveStatus()
+            if (secrets.hostPin(host, port) == null) {
+                val probed = runCatching { withContext(Dispatchers.IO) { SshBackend.probeHostKey(host, port) } }
+                if (probed.isFailure) {
+                    // T3: dial จาก countdown และ network ยังไม่กลับ = ต่อ countdown (banner เหลือง) ไม่ใช่ error จบวง
+                    if (autoRetry) {
+                        if (gen == s.dialGen) maybeScheduleReconnect(s) // superseded = ปล่อยให้คิวรุ่นใหม่ดูแลเอง
+                        else Log.d("AtermRC", "stale dial dropped (probe fail) gen=$gen cur=${s.dialGen}")
                         return@launch
                     }
-                    secrets.putHostPin(host, port, "$algo $fp")
+                    renderError(s, probed.exceptionOrNull()?.message ?: "host-key probe failed")
+                    return@launch
                 }
+                val (algo, key) = probed.getOrThrow()
+                val fp = SshBackend.fingerprint(key)
+                if (gen != s.dialGen) { // T4: กัน dialog/แดง ของ dial ที่ถูกรุ่นใหม่แทนแล้ว
+                    Log.d("AtermRC", "stale dial dropped (post-probe) gen=$gen cur=${s.dialGen}"); return@launch
+                }
+                val ok = withContext(Dispatchers.Main) { connectUi.tofuDialog(host, port, algo, fp) }
+                if (!ok) {
+                    s.error = "connection refused (host key not accepted)"
+                    refreshTabs(); renderActiveStatus()
+                    return@launch
+                }
+                secrets.putHostPin(host, port, RepromptPolicy.pinValue(algo, fp))
             }
             // real connect: compare pin — synchronous + cheap, ไม่มี UI ข้าม thread
             val verifier: (java.net.SocketAddress, java.security.PublicKey) -> Boolean =
-                { _, k -> secrets.hostPin(host, port) == "${SshBackend.sshKeyType(k)} ${SshBackend.fingerprint(k)}" }
+                { _, k -> secrets.hostPin(host, port) == RepromptPolicy.pinValue(SshBackend.sshKeyType(k), SshBackend.fingerprint(k)) }
+            val tag = paneTag(s)
+            val diag: (String) -> Unit = { ConnectionLog.d("ssh $tag $it") }
             val backend = if (p.type == "termux")
                 // round 6: type=termux = TermuxBackend (contract) + delegate SshBackend ตัวเดิมผ่าน factory
-                TermuxBackend(port) { h, pt -> SshBackend(h, pt, p.user, keyPath, password, verifier) }
-            else SshBackend(host, port, p.user, keyPath, password, verifier)
+                TermuxBackend(port) { h, pt -> SshBackend(h, pt, p.user, privateKey, password, verifier, diagnostics = diag, keyPassphrase = keyPassphrase) }
+            else SshBackend(host, port, p.user, privateKey, password, verifier, diagnostics = diag, keyPassphrase = keyPassphrase)
             if (gen != s.dialGen) { // T4 gate สำคัญ: ห้ามเปิด shell รุ่นเก่า (probe ชนะแข่งตอน network หายไป)
                 Log.d("AtermRC", "stale dial dropped (pre-open) gen=$gen cur=${s.dialGen}"); return@launch
             }
+            s.manualDial = !autoRetry
             openSession(s, backend, p)
+        }
+    }
+
+    /**
+     * re-pin (round 16): host ที่ pin แล้ว key เปลี่ยน (server ลงใหม่/rotate key) ผู้ใช้ติดตาย — ไม่มีทางล้าง pin
+     * จึง probeหากุญแจจริงของ server แล้วให้ผู้ใช้ยืนยัน old/new fingerprint (RepromptPolicy — มี test):
+     *  - Accept → เปลี่ยน pin + startConnect รุ่นใหม่ (เทียบเท่าแตะ status bar เอง, auth ครบผ่าน flow เดิม)
+     *  - Reject / dialog ไม่ขึ้น / probe fail → คง error แดง (policy หยุดถาวรอยู่เองเพราะ retryable=false)
+     * ห้ามเรียกจาก auto countdown — shouldPrompt ตรวจ manualDial ให้แล้ว (กฎเดิม: countdown ห้ามเด้ง dialog)
+     */
+    private fun offerReprompt(s: TerminalSession) {
+        val p = s.profile ?: return
+        val host: String?
+        val port: Int
+        when (p.type) {
+            "termux" -> { host = "127.0.0.1"; port = 8022 } // key ของ sshd ใน Termux เปลี่ยนได้จริงเมื่อ reinstall
+            else -> { host = p.host; port = p.port }
+        }
+        if (host == null) return
+        val oldPin = secrets.hostPin(host, port) ?: return // ไม่มี pin = ไม่ใช่กรณี re-pin (TOFU คุมอยู่)
+        val old = RepromptPolicy.parsePin(oldPin)
+            ?: run { ConnectionLog.d("reprompt skipped: corrupt pin record for $host:$port"); return }
+        val gen = s.dialGen
+        lifecycleScope.launch {
+            val probed = runCatching { withContext(Dispatchers.IO) { SshBackend.probeHostKey(host, port) } }
+            if (probed.isFailure) {
+                // network/-server ขัดข้องต่อ = คง error แดงเดิม ไม่เพิ่ม dialog ผู้ใช้ tap ใหม่เมื่อพร้อม
+                ConnectionLog.d("reprompt probe failed: ${probed.exceptionOrNull()?.message}")
+                return@launch
+            }
+            val (algo, key) = probed.getOrThrow()
+            if (gen != s.dialGen) { // T4-style guard: ผู้ใช้ tap dial ใหม่ระหว่าง probe = ปล่อยรุ่นใหม่ดูแล
+                Log.d("AtermRC", "stale reprompt dropped (post-probe) gen=$gen cur=${s.dialGen}")
+                return@launch
+            }
+            val fp = SshBackend.fingerprint(key)
+            val ok = withContext(Dispatchers.Main) { connectUi.rePinDialog(host, port, old.first, old.second, algo, fp) }
+            if (gen != s.dialGen) {
+                Log.d("AtermRC", "stale reprompt dropped (post-dialog) gen=$gen cur=${s.dialGen}")
+                return@launch
+            }
+            if (ok) {
+                secrets.putHostPin(host, port, RepromptPolicy.pinValue(algo, fp))
+                ConnectionLog.d("reprompt accepted $host:$port $algo $fp")
+                startConnect(s, p, interactive = true) // gen ใหม่ = ล้างแดง, auth (password/key) ผ่าน flow เดิม
+            } else {
+                ConnectionLog.d("reprompt rejected $host:$port")
+                s.error = "connection refused (host key change not accepted)" // เหมือน pattern tofu-refuse: ไม่เข้า state machine
+                refreshTabs()
+                renderActiveStatus()
+            }
         }
     }
 
     private fun openSession(s: TerminalSession, backend: TerminalBackend, p: Profile) {
         val go = {
-            if (s.native) s.engine?.write(byteArrayOf(0x1b, 0x63)) else s.js("window.term && term.reset();") // ESC c = full reset ≡ term.reset (probe ris)
             s.controller.connect(
                 backend,
                 StartupArgs(p.commandline, p.startingDirectory, s.cols, s.rows, p.environment),
-            )
+            ) {
+                // ESC c = full reset ≡ term.reset (probe ris)
+                if (s.native) s.engine?.write(byteArrayOf(0x1b, 0x63)) else s.js("window.term && term.reset();")
+            }
         }
         // pane ใหม่: user tap เร็วกว่า loadUrl จบ ได้ — อย่าทิ้ง bytes แรกของ backend (round 4 bug)
         if (s.pageReady) go() else s.pendingConnect = go
@@ -1701,7 +1917,7 @@ class MainActivity : ComponentActivity() {
             list = settings.profiles.list.filterNot { it.guid == p.guid }))
         persistSettings()
         p.guid?.let { secrets.setPassword(it, null) }
-        p.keyAlias?.let { secrets.keyFile(it)?.delete() }
+        p.keyAlias?.let { secrets.deleteKey(it) }
         refreshTabs()
     }
 
@@ -1802,6 +2018,10 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        ConnectionLog.d("activity onDestroy finishing=$isFinishing config=$isChangingConfigurations changing=0x${Integer.toHexString(changingConfigurations)} sessions=${connectedPaneCount()}")
+        connectionDiagnostics?.stop()
+        connectionDiagnostics = null
+        SessionKeepAliveService.onDisconnectAll = null
         flushSnapshotNow() // T4: graceful kill (back/swipe) = เก็บ snapshot รุ่นล่าสุดก่อนตาย
         settingsWatcher?.stop()
         settingsWatcher = null
@@ -1814,6 +2034,8 @@ class MainActivity : ComponentActivity() {
                 for (p in tv.slots) p?.let { disposeSession(it) }
             }
         }
+        // session ตายไปกับ Activity แล้ว ไม่เหลืออะไรให้ service ดูแล
+        SessionKeepAliveService.sync(this, KeepAlivePolicy.decide(0, 0, 0, false), canStart = false)
         super.onDestroy()
     }
 
@@ -2014,6 +2236,7 @@ class MainActivity : ComponentActivity() {
     }.toString()
 
     companion object {
+        private const val REQ_NOTIFICATIONS = 4101
         private const val PANE_FOCUS = 0xFF3DA0FF.toInt()   // กรอบ focused pane (accent เดียวกับ theme)
         private const val CRASH_LOOP_WINDOW_MS = 15_000L    // T4: boot ใหม่ไวเกินไปหลัง restore attempt = ข้าม restore ครั้งเดียว
     }
