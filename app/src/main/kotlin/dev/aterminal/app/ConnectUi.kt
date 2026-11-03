@@ -40,7 +40,8 @@ class ConnectUi(private val act: MainActivity) {
             (p.name ?: p.guid ?: "?") + tail
         } + listOf("➕ Add profile…", "✏️ Edit profile…", "🗑 Delete profile…",
             "⬇ Export settings.json", "⬆ Import settings.json…", "📄 Open source licenses", "🔍 Copy connection log",
-            "🔋 Keep CPU awake while connected: " + if (act.settings.keepCpuAwake) "On" else "Off")
+            "🔋 Keep CPU awake while connected: " + if (act.settings.keepCpuAwake) "On" else "Off",
+            "🖥 Renderer: " + if (act.settings.engine == "native") "Native (tap → WebView)" else "WebView (tap → Native)")
         AlertDialog.Builder(act)
             .setTitle("New session")
             .setItems(titles.toTypedArray()) { d, which ->
@@ -53,6 +54,7 @@ class ConnectUi(private val act: MainActivity) {
                     which == profiles.size + 5 -> { d.dismiss(); showLicenses() }
                     which == profiles.size + 6 -> { d.dismiss(); act.copyConnectionLog() }
                     which == profiles.size + 7 -> { d.dismiss(); act.toggleKeepCpuAwake() }
+                    which == profiles.size + 8 -> { d.dismiss(); act.toggleEngine() }
                     else -> { d.dismiss(); act.connectProfile(profiles[which]) }
                 }
             }

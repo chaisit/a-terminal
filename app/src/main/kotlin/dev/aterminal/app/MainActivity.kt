@@ -731,6 +731,8 @@ class MainActivity : ComponentActivity() {
 
     @SuppressLint("SetJavaScriptEnabled")
     private fun createSession(): TerminalSession {
+        // round 18: pane ใหม่เลือก renderer ตรงนี้ — log ไว้ prove ได้ว่า pane ไหน engine อะไร (gate/menu toggle)
+        Log.i("AtermEngine", "pane renderer=" + if (settings.engine == "native" || webviewTooOld) "native" else "webview")
         if (settings.engine == "native" || webviewTooOld) {
             if (webviewTooOld && settings.engine != "native") {
                 Log.i("AtermEngine", "WebView major <86 (replaceChildren ไม่พอ) — fallback native engine")
@@ -1419,6 +1421,13 @@ class MainActivity : ComponentActivity() {
         if (prefs.getBoolean("asked_notifications", false)) return
         prefs.edit().putBoolean("asked_notifications", true).apply()
         requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), REQ_NOTIFICATIONS)
+    }
+
+    /** round 18: สลับ renderer สำหรับ pane ใหม่ (engine ถูกอ่านตอนสร้าง pane — tab เดิมไม่ย้าย) */
+    internal fun toggleEngine() {
+        settings = settings.copy(engine = RendererToggle.next(settings.engine))
+        persistSettings()
+        toast(if (settings.engine == "native") "New panes use the native engine" else "New panes use WebView")
     }
 
     internal fun toggleKeepCpuAwake() {

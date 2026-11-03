@@ -1,8 +1,15 @@
 # Changelog
 
+## 0.4.6
+
+- The **New session** menu has a **Renderer** item: tap it to switch new panes between the WebView engine
+  (default) and the native Kotlin engine, without hand-editing `settings.json`. Existing panes keep the
+  renderer they were opened with. The native renderer is experimental — WebView remains the default and
+  is the better-rendered of the two today.
+
 ## 0.4.5
 
-Everything added since 0.3.0 (this is the current release):
+Everything added since 0.3.0:
 
 - SSH sessions survive backgrounding: while a session is open a foreground service keeps the process and
   network alive, and an app-level keepalive stops real networks from silently dropping idle connections.
