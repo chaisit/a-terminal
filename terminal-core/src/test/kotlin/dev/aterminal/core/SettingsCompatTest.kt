@@ -2,6 +2,7 @@ package dev.aterminal.core
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -28,7 +29,7 @@ class SettingsCompatTest {
         "list": [
           { "guid": "scaffold-demo", "name": "Echo (scaffold)", "type": "echo", "hidden": false },
           { "guid": "termux-local", "name": "Termux (local)", "type": "termux", "hidden": false,
-            "note": "ต้องมี Termux + sshd บน localhost:8022 — ดู docs/setup.md" },
+            "note": "ต้องมี Termux + sshd บน localhost:8022" },
           { "guid": "lab-host", "name": "Lab (host sshd)", "type": "ssh", "host": "10.0.2.2", "port": 22,
             "user": "kai", "authMethod": "key", "keyAlias": null }
         ]
@@ -39,7 +40,9 @@ class SettingsCompatTest {
         { "keys": "ctrl+shift+f", "command": "find" }
       ],
       "copyOnSelect": false,
-      "trimPaste": true
+      "trimPaste": true,
+      "backAsEscape": true,
+      "hideKeysBarOnHardwareKeyboard": false
     }
     """.trimIndent()
 
@@ -115,6 +118,34 @@ class SettingsCompatTest {
         assertTrue(SettingsLoader.parse("""{"autoPasteClipboard": true}""").autoPasteClipboard)
         // round-trip ผ่าน render (field ใหม่อยู่ใน canonical subset ของเรา)
         val off = SettingsLoader.parse("""{"autoPasteClipboard": false}""")
+        assertEquals(off, SettingsLoader.parse(SettingsLoader.render(off)))
+    }
+
+    // round 23 (ADR 0002): Back-as-Escape default ON = deliberate behavior change —
+    // ไฟล์ legacy ที่ไม่มี field ต้องได้ true (parse ทางเดียวที่นับ: Settings() ตรง ๆ ไม่ prove absent-field path)
+    @Test fun `backAsEscape default true survives legacy json (absent → true)`() {
+        assertTrue(SettingsLoader.parse("""{"profiles":{"list":[]}}""").backAsEscape)
+        assertTrue(SettingsLoader.parse(shippedJson).backAsEscape) // ไฟล์จริงที่ ship ก็ต้องได้ true
+        assertFalse(SettingsLoader.parse("""{"backAsEscape":false}""").backAsEscape) // ปิดได้ด้วยการตั้งค่าเอง
+    }
+
+    @Test fun `hideKeysBarOnHardwareKeyboard defaults false and parses true`() {
+        assertFalse(SettingsLoader.parse("""{}""").hideKeysBarOnHardwareKeyboard)
+        assertTrue(SettingsLoader.parse("""{"hideKeysBarOnHardwareKeyboard":true}""").hideKeysBarOnHardwareKeyboard)
+    }
+
+    // round 23 amendment (Update Check): auto ON default (user ตัดสิน Q7) แต่มี opt-out;
+    // dismissedUpdateTag/lastUpdateCheckAt = machine state, absent = null (legacy json ไม่ nag อะไรเพิ่ม)
+    @Test fun `updateChecks defaults true with nullable state fields`() {
+        val legacy = SettingsLoader.parse("""{"profiles":{"list":[]}}""")
+        assertTrue(legacy.updateChecks)
+        assertNull(legacy.dismissedUpdateTag)
+        assertNull(legacy.lastUpdateCheckAt)
+        // ปิดได้ + state round-trip
+        val off = SettingsLoader.parse("""{"updateChecks":false,"dismissedUpdateTag":"v0.6.0","lastUpdateCheckAt":1700000000000}""")
+        assertFalse(off.updateChecks)
+        assertEquals("v0.6.0", off.dismissedUpdateTag)
+        assertEquals(1700000000000L, off.lastUpdateCheckAt)
         assertEquals(off, SettingsLoader.parse(SettingsLoader.render(off)))
     }
 

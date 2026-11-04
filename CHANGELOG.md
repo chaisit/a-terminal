@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.5.0
+
+- **The top bar is one row now.** The status strip moved into the tab row: session pills, the status
+  line, the **∨** new-session menu and the new **⋮** overflow menu all share a single row, and the
+  terminal gained the freed rows back. Everything the old strip could do lives in **⋮** — font size,
+  keep-CPU-awake, log copy, settings export/import, renderer switch — and your installed version is
+  printed at the bottom of that menu.
+- **The keys bar always fits the screen.** It now stretches edge to edge, and keys that no longer fit
+  fold into a **⋯** popup instead of scrolling out of reach — every key is at most two taps away.
+  Rotating the device re-fits the bar. A **⚡ paste** button is back in the bar.
+- **Pinch with two fingers to change the font size**, like a map app.
+- **Back now sends Escape** while a session is open and the keyboard is down (like Termux's back-key),
+  so a stray Back press no longer leaves the app; it still closes the keyboard and dialogs first, and
+  you can turn the behaviour off via `backAsEscape` in settings.json.
+- **Menus never hide behind the keyboard** — opening any menu closes the on-screen keyboard first.
+- **Update check.** A-Terminal now checks GitHub Releases at most once a day and tells you when a new
+  version is out, showing the release notes of every version you skipped in one dialog; **View
+  release** opens the download page in your browser (the app never installs anything itself). You can
+  also check any time from **⋮ → Check for updates**, and switch the automatic check off with
+  **🌐 Update checks**.
+- With a physical keyboard connected, the keys bar can hide itself to give the grid more room
+  (opt in via `hideKeysBarOnHardwareKeyboard` in settings.json).
+- Bar menus, popups and dialogs now follow your terminal colour scheme, and the native renderer draws
+  Thai upper/lower marks without clipping, keeps table columns straight, and places its scrollbar in
+  its own reserved slot.
+
 ## 0.4.8
 
 - **The on-screen keyboard only appears when you ask for it.** Tapping the terminal — or starting a

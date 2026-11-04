@@ -63,8 +63,9 @@ const term = new Terminal({
   fontFamily: ATERM_FONT,
   fontSize: 14,
   // bundle 5.5 ไม่มี fontAscender/fontDescender (ตรวจกับ bundle แล้ว) — lineHeight คือปุ่มเดียวที่มี
-  // FiraCode ตั้ง 1.23em ในตัว (hhea) ไทยสามระดับยังมี Mai-ek/mai-tho เหนือ ascender → 1.2 (≒ native cellH 1.15em floor)
-  lineHeight: 1.2,
+  // FiraCode ตั้ง 1.23em ในตัว (hhea) ไทยสามระดับยังมี Mai-ek/mai-tho เหนือ ascender → round 23: Mark
+  // Headroom ยก 1.2→1.33 (≡ native cellH + clearancePx, both renderers) ให้ mark ไม่ชน neighboring rules
+  lineHeight: 1.33,
   // xterm 5.5: ลดขนาด glyph ที่ล้น cell (ออกแบบเพื่อ Thai/CJK ที่ mark ไม่มี grapheme addon — ตรงบั๊ก Honor V6)
   rescaleOverlappingGlyphs: true,
   scrollback: 9001,
@@ -142,9 +143,10 @@ function fit(retry) {
   // (วัดกล่องที่ feedback กับผลของตัวเอง = fixed-point ล้น viewport; ตรวจด้วย CDP device)
   // round 7: find bar dock — aterm-find.js กัน top area ไว้ (กัน highlight แถวบนโดน bar บัง)
   const inset = window.__atermInsetTop || 0;
-  // fallback 17→20 (round 15-HW): cellH จริงตอนนี้ ≈ 21px (14px × 1.23em × lineHeight 1.2) — ค่าเก่าทำให้ over-estimate rows ตอน metrics-starved
+  // fallback 17→20 (round 15-HW) → 23 (round 23 Mark Headroom): cellH จริงตอนนี้ ≈ 23px
+  // (14px × 1.23em × lineHeight 1.33) — ค่าเก่าทำให้ over-estimate rows ตอน metrics-starved
   const cols = Math.max(20, Math.floor(box.clientWidth / (cell.width || 8.4)));
-  const rows = Math.max(6, Math.floor((box.clientHeight - inset) / (cell.height || 20)));
+  const rows = Math.max(6, Math.floor((box.clientHeight - inset) / (cell.height || 23)));
   term.resize(cols, rows);
   if (window.Droid) Droid.onResize(cols, rows);
 }
@@ -343,7 +345,7 @@ if (window.Droid && Droid.copyOnSelect && Droid.copyOnSelect()) {
       // 1 notch ต่อ cell.height px: นิ้วลากลง = ดูของเก่า = wheel-up report (xterm: deltaY<0 → button code 64)
       // magnitude ต้อง ≥ 1 row: getLinesScrolled (gate ของ wheel listener) คำนวณ deltaY/rowHeight แล้ว floor —
       // ±1px = 0 บรรทัด = ไม่มี report (ตรวจบน device แล้ว round 4); ใช้ ±ch พอดี → partial เหลือ ~0
-      const ch = (term._core._renderService.dimensions.css.cell.height) || 17;
+      const ch = (term._core._renderService.dimensions.css.cell.height) || 23;
       wheelAcc += t.clientY - prevY; prevY = t.clientY;
       while (Math.abs(wheelAcc) >= ch) {
         const sgn = wheelAcc > 0 ? 1 : -1;

@@ -14,6 +14,7 @@ import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
 import dev.aterminal.core.Profile
+import dev.aterminal.core.Settings
 import java.util.UUID
 
 /**
@@ -28,9 +29,13 @@ class ConnectUi(private val act: MainActivity) {
     var pendingKeyAlias: String? = null   // ผล SAF import ล่าสุด (รอฟอร์ม save)
     private var importTarget: ((alias: String) -> Unit)? = null
 
-    // ---------- profile list ----------
+    // ---------- profile list (task 7 round 23: slim = picker + Add เท่านั้น — action อื่นย้ายเข้า ⋮ overflow) ----------
     fun showProfileList() {
-        val profiles = act.settings.profiles.list.filterNot { it.hidden }
+        // task 10 (round 23): ทุก dialog ในไฟล์นี้เปิดหลัง closeImeForMenus() — menu/dialog = user สั่งปิด IME
+        // (ADR 0001: ห้าม IME ค้างทับ dialog และห้าม auto-reopen; pinned โดย CloseImePolicyGuardTest)
+        // toast() ไม่-count = ไม่ใช่ dialog, ไม่มี IME flow
+        act.closeImeForMenus()
+        val profiles = visibleProfiles()
         val titles = profiles.map { p ->
             val tail = when (p.type) {
                 "ssh" -> "  ${p.user ?: ""}@${p.host}:${p.port}"
@@ -38,23 +43,12 @@ class ConnectUi(private val act: MainActivity) {
                 else -> "  (${p.type})"
             }
             (p.name ?: p.guid ?: "?") + tail
-        } + listOf("➕ Add profile…", "✏️ Edit profile…", "🗑 Delete profile…",
-            "⬇ Export settings.json", "⬆ Import settings.json…", "📄 Open source licenses", "🔍 Copy connection log",
-            "🔋 Keep CPU awake while connected: " + if (act.settings.keepCpuAwake) "On" else "Off",
-            "🖥 Renderer: " + if (act.settings.engine == "native") "Native (tap → WebView)" else "WebView (tap → Native)")
+        } + listOf("➕ Add profile…")
         AlertDialog.Builder(act)
             .setTitle("New session")
             .setItems(titles.toTypedArray()) { d, which ->
                 when {
                     which == profiles.size -> { d.dismiss(); showAddForm() }
-                    which == profiles.size + 1 -> { d.dismiss(); showEditList(profiles) }
-                    which == profiles.size + 2 -> { d.dismiss(); showDeleteList(profiles) }
-                    which == profiles.size + 3 -> { d.dismiss(); act.settingsUi.export() }
-                    which == profiles.size + 4 -> { d.dismiss(); act.settingsUi.import() }
-                    which == profiles.size + 5 -> { d.dismiss(); showLicenses() }
-                    which == profiles.size + 6 -> { d.dismiss(); act.copyConnectionLog() }
-                    which == profiles.size + 7 -> { d.dismiss(); act.toggleKeepCpuAwake() }
-                    which == profiles.size + 8 -> { d.dismiss(); act.toggleEngine() }
                     else -> { d.dismiss(); act.connectProfile(profiles[which]) }
                 }
             }
@@ -62,8 +56,25 @@ class ConnectUi(private val act: MainActivity) {
             .showGuarded(act)
     }
 
+    /** โปรไฟล์ที่แสดงใน picker/list (filterHidden เดียวกันทุกทางเข้า — single source: extension ท้ายไฟล์) */
+    internal fun visibleProfiles(): List<Profile> = act.settings.visibleProfiles()
+
+    /**
+     * ⋮ Profiles group (task 7 decision): active pane มี profile = ทำงานกับตัวนั้นตรง ๆ,
+     * ไม่มี (blank tab) = list-pick fallback — dialog ทั้งหมด reuse ของเดิม (showProfileForm/showEditList)
+     */
+    internal fun editProfileOf(p: Profile?) {
+        if (p != null) showProfileForm(p) else showEditList(visibleProfiles())
+    }
+
+    /** เหมือน editProfileOf — delete ยังผ่าน confirmDelete (มี warning เรื่อง password/key ติดไปด้วย) */
+    internal fun deleteProfileOf(p: Profile?) {
+        if (p != null) confirmDelete(p) else showDeleteList(visibleProfiles())
+    }
+
     /** notices ของ dependency/ฟอนต์ที่ติดไปกับ APK (MIT/Apache/CC BY ต้องให้ผู้รับเข้าถึงได้) */
-    private fun showLicenses() {
+    internal fun showLicenses() {
+        act.closeImeForMenus() // task 10 menu policy
         val text = act.assets.open("licenses/THIRD_PARTY_NOTICES.txt").bufferedReader().use { it.readText() }
         AlertDialog.Builder(act)
             .setTitle("Open source licenses")
@@ -73,6 +84,7 @@ class ConnectUi(private val act: MainActivity) {
     }
 
     private fun showDeleteList(profiles: List<Profile>) {
+        act.closeImeForMenus() // task 10 menu policy
         if (profiles.isEmpty()) { toast("no profiles"); return }
         AlertDialog.Builder(act)
             .setTitle("Delete which profile?")
@@ -84,6 +96,7 @@ class ConnectUi(private val act: MainActivity) {
     }
 
     private fun confirmDelete(p: Profile) {
+        act.closeImeForMenus() // task 10 menu policy
         AlertDialog.Builder(act)
             .setTitle("Delete profile")
             .setMessage("Delete \"${p.name}\"? Its saved password or key is deleted too.")
@@ -96,6 +109,7 @@ class ConnectUi(private val act: MainActivity) {
     fun showAddForm() = showProfileForm(null)
 
     private fun showEditList(profiles: List<Profile>) {
+        act.closeImeForMenus() // task 10 menu policy
         if (profiles.isEmpty()) { toast("no profiles"); return }
         AlertDialog.Builder(act)
             .setTitle("Edit which profile?")
@@ -114,6 +128,7 @@ class ConnectUi(private val act: MainActivity) {
      *  - type spinner: termux = host/port lock ที่ 127.0.0.1:8022 (ตรงกับ startSession), echo = ซ่อน host/auth
      */
     fun showProfileForm(existing: Profile?) {
+        act.closeImeForMenus() // task 10 menu policy (form เปิด IME เองได้เฉพาะเมื่อ user tap field)
         val pad = (16 * act.resources.displayMetrics.density).toInt()
         val form = LinearLayout(act).apply {
             orientation = LinearLayout.VERTICAL
@@ -254,6 +269,7 @@ class ConnectUi(private val act: MainActivity) {
 
     // ---------- passphrase ของ private key (ตอน connect) ----------
     fun promptPassphrase(onOk: (passphrase: String, remember: Boolean) -> Unit) {
+        act.closeImeForMenus() // task 10 menu policy (IME ของ dialog ตัวเองเกิดเมื่อ user tap field)
         val pad = (16 * act.resources.displayMetrics.density).toInt()
         val box = LinearLayout(act).apply {
             orientation = LinearLayout.VERTICAL
@@ -276,6 +292,7 @@ class ConnectUi(private val act: MainActivity) {
 
     // ---------- password prompt (ตอน connect) ----------
     fun promptPassword(p: Profile, onOk: (password: String, remember: Boolean) -> Unit) {
+        act.closeImeForMenus() // task 10 menu policy (IME ของ dialog ตัวเองเกิดเมื่อ user tap field)
         val pad = (16 * act.resources.displayMetrics.density).toInt()
         val box = LinearLayout(act).apply {
             orientation = LinearLayout.VERTICAL
@@ -302,6 +319,7 @@ class ConnectUi(private val act: MainActivity) {
      */
     suspend fun tofuDialog(host: String, port: Int, algo: String, fingerprint: String): Boolean =
         kotlinx.coroutines.suspendCancellableCoroutine { cont ->
+            act.closeImeForMenus() // task 10 menu policy — dialog ห้ามเปิดทับคีย์บอร์ด
             val dlg = AlertDialog.Builder(act)
                 .setTitle("Verify host key")
                 .setMessage(
@@ -330,6 +348,7 @@ class ConnectUi(private val act: MainActivity) {
         oldAlgo: String, oldFingerprint: String,
         newAlgo: String, newFingerprint: String,
     ): Boolean = kotlinx.coroutines.suspendCancellableCoroutine { cont ->
+        act.closeImeForMenus() // task 10 menu policy — dialog ห้ามเปิดทับคีย์บอร์ด
         val dlg = AlertDialog.Builder(act)
             .setTitle("Host key has changed")
             .setMessage(RepromptPolicy.warningMessage(host, port, oldAlgo, oldFingerprint, newAlgo, newFingerprint))
@@ -348,3 +367,11 @@ class ConnectUi(private val act: MainActivity) {
 
     companion object { const val REQ_KEY = 0x51 }
 }
+
+/**
+ * แหล่งเดียวของ filter hidden-profile (parked (n), fix wave): picker ของ ConnectUi, barSnap ของ
+ * MainActivity (เมนู ∨) และ lookup ชื่อจาก ∨ picker ต้องอ่านผ่าน fun นี้ทั้งหมด —
+ * การเขียน filterNot { it.hidden } ซ้ำเป็นที่สาม = picker สองอันที่ drift กันได้
+ * (comment "ห้ามมี list versionที่สอง" เดิมห้ามด้วยข้อความ ตอนนี้ห้ามด้วย implementation เดียว)
+ */
+internal fun Settings.visibleProfiles(): List<Profile> = profiles.list.filterNot { it.hidden }

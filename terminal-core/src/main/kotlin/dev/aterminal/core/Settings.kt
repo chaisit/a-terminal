@@ -35,6 +35,25 @@ data class Settings(
     // WT schema ไม่มี field restore ตรงตัว (startupActions:2543 = action grammar, ไม่ใช่ session state) → extension by precedent
     // ค่าเดิม true; false = boot เดิม (tab ว่างตัวเดียว) ทุกอย่างเหมือน round ≤12
     val restoreSessions: Boolean = true,
+    // non-WT extension (round 23 chrome): Keys Bar preset name — WT schema มี keybindings (hardware chords)
+    // แต่ไม่มี on-screen key bar เลย → preset reference, layout จริงอยู่ที่ KeyPresets (unknown name → default)
+    val keysPreset: String = "default",
+    // non-WT extension (round 23 chrome, ADR 0002): ปุ่ม Back บน terminal surface (ไม่มี dialog/IME เปิดค้าง) = ESC
+    // ≡ Termux back-key=escape — WT schema ไม่มี Back policy (ไม่มี concept ปุ่ม back ของ Android)
+    // ค่าเดิม true = deliberate behavior change ตาม ADR 0002 (swipe ที่เคยเสียเปล่ากลายเป็น ESC ที่มีประโยชน์); false = พฤติกรรมเดิม
+    val backAsEscape: Boolean = true,
+    // non-WT extension (round 23 chrome, ADR 0002): hardware keyboard เชื่อมต่อ/เปิด = ยุบ Keys Bar คืนพื้นที่ grid
+    // WT ไม่มี concept นี้ (คีย์บอร์ดจริงคือ default ของ desktop) — ค่าเดิม false = bar แสดงเสมอเหมือนเดิมทุกตัวอักษร
+    val hideKeysBarOnHardwareKeyboard: Boolean = false,
+    // non-WT extension (round 23 amendment): Update Check opt-out —
+    // ค่าเดิม true = auto ≤1×/วัน; manual จาก ⋮ ไม่ถูกบล็อกโดย field นี้ (UpdateCheck.shouldAutoCheck)
+    val updateChecks: Boolean = true,
+    // release ที่ user เคยเห็น/กด Later (Update Notice = ครั้งเดียวต่อ release)
+    // ห้ามเทียบกับ semantic version ที่นี่ — เทียบ tag ตรงตัว, release ใหม่กว่า = tag ต่าง = เตือนได้
+    val dismissedUpdateTag: String? = null,
+    // epoch-ms ของการเช็คครั้งล่าสุด (auto throttle 1×/วัน) — machine state ที่ persist ตามธรรมเนียม
+    // lastSettingsHash-free: เขียนผ่าน persistSettings funnel เดียว, watcher กัน self-write อยู่แล้ว
+    val lastUpdateCheckAt: Long? = null,
 )
 
 @Serializable

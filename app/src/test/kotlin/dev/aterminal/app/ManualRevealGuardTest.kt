@@ -35,15 +35,21 @@ class ManualRevealGuardTest {
             !s.contains("focusAndReveal"))
     }
 
-    @Test fun `IME log export works in release too but stays hidden`() {
-        // user อนุมัติ 2026-11-04: A− export ออกจาก debug-only (เจอจริง: Honor ลง release → แตะแช่เงียบ,
-        // ring เองก็ไม่ถูกบันทึกใน release) — แต่ทางเข้าเดียวคือ long-press ซ่อน ห้ามโผล่ visible ใน UI
+    @Test fun `IME log export works in release too and has exactly one entry point`() {
+        // user อนุมัติ 2026-11-04: export ออกจาก debug-only (เจอจริง: Honor ลง release → แตะแช่เงียบ,
+        // ring เองก็ไม่ถูกบันทึกใน release) — round 23 task 7: status strip/A− ถูกลบ,
+        // ทางเข้าเดียว ย้ายเป็น ⋮ overflow "Copy IME log" (brief pin เอง — policy "ซ่อน" เดิมถูก supersede)
         val s = src("MainActivity.kt")
         assertTrue("ring ห้ามถูก gate ทั้งก้อนด้วย debugImeLog — release ต้องมี log ให้ export",
             !s.contains("if (!debugImeLog) return"))
-        assertTrue("long-press A− ห้ามถูก gate — release ต้องกดได้",
-            !s.contains("if (debugImeLog) zoomOutBtn.setOnLongClickListener"))
-        assertTrue("A− ต้อง wired อยู่ (ซ่อน — ห้ามย้ายเข้าเมนู visible)",
-            s.contains("zoomOutBtn.setOnLongClickListener"))
+        assertTrue("export ห้ามถูก gate ด้วย debugImeLog — release ต้อง export ได้",
+            !s.contains("if (debugImeLog) exportImeLog"))
+        assertTrue("⋮ overflow ต้อง wired ไป exportImeLog (id copy_ime_log — ทางเข้าเดียว)",
+            s.contains("OverflowItemId.copyImeLog -> exportImeLog()"))
+        assertTrue("เมนู ⋮ ต้องมีรายการ Copy IME log",
+            src("TabBar.kt").contains("Copy IME log"))
+        // "exactly one entry point" ต้องวัดได้จริง: ไม่นับบรรทัดนิยาม = เหลือ call-site เดียวทั้งไฟล์
+        val calls = Regex("""(?<!fun )exportImeLog\(""").findAll(s).count()
+        assertEquals("exportImeLog( ห้ามมี door ที่สอง (call-site เดียว = ⋮ copy_ime_log)", 1, calls)
     }
 }

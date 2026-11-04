@@ -131,9 +131,10 @@ class TerminalView @JvmOverloads constructor(context: Context, attrs: AttributeS
         val fm = basePaint.fontMetrics
         cellW = maxOf(1f, ceil(basePaint.measureText("M")))
         val lineH = fm.descent - fm.ascent
-        // round 15-HW: สูตร cellH คงเดิม by design — canvas ไม่ clip glyph ต่อ cell และ bundled FiraCode
-        // (hhea 1.23em) × 1.05 ≈ webview `lineHeight:1.2` พอดี; ถ้า Honor retest ยังเห็น native clip ค่อยคุยกัน
-        cellH = maxOf(1f, ceil(maxOf(lineH * 1.05f, fontSizePx * 1.15f)))
+        // round 23: Mark Headroom — cellH เดิม (round 15-HW) แค่ ~= webview 1.2, ไทยสามระดับยังชน
+        // neighboring rules → + clearance ต่อ font size (MarkHeadroom = single tunable, ≡ webview 1.33)
+        // baselineOffset ด้านล่าง center ด้วย (cellH - lineH)/2 อยู่แล้ว = ห้าม center ซ้ำ
+        cellH = maxOf(1f, ceil(maxOf(lineH * 1.05f, fontSizePx * 1.15f))) + MarkHeadroom.clearancePx(fontSizePx)
         baselineOffset = ((cellH - lineH) / 2f - fm.ascent)
         requestLayout(); invalidate()
         if (width > 0 && height > 0) onSizeChanged(width, height, 0, 0) // cell metrics เปลี่ยน = grid count เปลี่ยน
@@ -270,8 +271,9 @@ class TerminalView @JvmOverloads constructor(context: Context, attrs: AttributeS
             val travel = gridH - thumbH
             val thumbY = if (b.baseY > 0) vpTop.toFloat() / b.baseY * travel else 0f
             paintScroll.color = 0x59FFFFFF
-            val w = width.toFloat()
-            canvas.drawRect(w - 4f, thumbY, w, thumbY + thumbH, paintScroll)
+            // T5 fix: draw in the dedicated slot right of the painted columns (ScrollBarSlot reserves it)
+            val tx = ScrollBarSlot.thumbX(width.toFloat(), cols * cellW)
+            canvas.drawRect(tx, thumbY, tx + ScrollBarSlot.THUMB_W, thumbY + thumbH, paintScroll)
         }
     }
 
@@ -298,8 +300,24 @@ class TerminalView @JvmOverloads constructor(context: Context, attrs: AttributeS
             }
             return
         }
-        // API31+: shape ทั้ง run (Thai cluster ข้าม codepoint ได้ตรง font position) แล้ววาด glyph ชุด
-        TextShaper.shapeText(run.text, 0, run.text.length, TextDirectionHeuristics.LTR, p) { _, _, glyphs, gp ->
+        // API31+: shaper path — cell lock decides run-relative vs per-cluster anchoring (round 23)
+        if (CellLock.needsPerCluster(run.text)) {
+            // Grid contract: every cluster occupies its own cell (RunMerger invariant: dummy skipped,
+            // wide isolated) → anchor cluster i at run.startCol + i, same as the API<31 Paint fallback.
+            // Run-relative advances here are what made Thai tables show crooked '│' columns.
+            var cx = x
+            for (c in Clusters.split(run.text)) {
+                shapeAndDraw(canvas, c, cx, baseline, p)
+                cx += cellW
+            }
+            return
+        }
+        shapeAndDraw(canvas, run.text, x, baseline, p)
+    }
+
+    /** Shape one text at origin x (shaper advances are relative to x only — the cell lock keeps runs lock-free) */
+    private fun shapeAndDraw(canvas: Canvas, text: String, x: Float, baseline: Float, p: TextPaint) {
+        TextShaper.shapeText(text, 0, text.length, TextDirectionHeuristics.LTR, p) { _, _, glyphs, gp ->
             val n = glyphs.glyphCount() // javap: method ไม่ใช่ property
             var i = 0
             while (i < n) {
@@ -338,7 +356,8 @@ class TerminalView @JvmOverloads constructor(context: Context, attrs: AttributeS
 
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
         if (w <= 0 || h <= 0 || cellW <= 0f) return
-        val cols = maxOf(1, (w / cellW).toInt())
+        // round 23 T5: floor over (w - thumb slot) — the scrollbar never paints over the last column
+        val cols = ScrollBarSlot.gridCols(w.toFloat(), cellW)
         val rows = maxOf(1, (h / cellH).toInt())
         if (cols == gridCols && rows == gridRows && engine != null) return
         gridCols = cols; gridRows = rows

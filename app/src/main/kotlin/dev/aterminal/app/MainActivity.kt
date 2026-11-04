@@ -25,9 +25,11 @@ import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.OnBackPressedCallback
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.graphics.toArgb // task 9: ChromeColors → view background (Int ARGB)
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.setViewTreeLifecycleOwner
 import androidx.savedstate.setViewTreeSavedStateRegistryOwner
@@ -39,6 +41,7 @@ import dev.aterminal.core.BackendError
 import dev.aterminal.core.CloseReason
 import dev.aterminal.core.Command
 import dev.aterminal.core.CommandCodec
+import dev.aterminal.core.KeyPresets
 import dev.aterminal.core.KeybindingResolver
 import dev.aterminal.core.Profile
 import dev.aterminal.core.ResolvedTable
@@ -65,7 +68,7 @@ import org.json.JSONObject
 /**
  * A-Terminal — multi-tab / split-pane SSH terminal (round 5)
  *
- * layout: [Compose tab strip] [status strip + A−/A+/⚡] [per-tab container] [ExtraKeysBar]
+ * layout: [Compose top bar v2 — เดียว: pills/title + ∨ picker + ⋮ overflow (round 23)] [per-tab container] [ExtraKeysBar]
  *  - หนึ่ง tab = 1–2 pane, pane = หนึ่ง WebView + หนึ่ง SessionController (terminal.html โหลดเดิมทั้งไฟล์)
  *  - container ต่อ tab = LinearLayout [wrapper0 | divider | wrapper1] — สร้างครั้งเดียวต่อ tab,
  *    split/ปิด pane = สลับ visibility + weight เท่านั้น **ไม่ re-parent WebView เลย** (InputConnection ไม่หลุด)
@@ -105,7 +108,6 @@ class MainActivity : ComponentActivity() {
     private var imeLongPressMs = 500L                  // ค่าระบบจริง (ViewConfiguration) — กำหนด hold-timer
     private val debugImeLog by lazy { (applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0 }
     private lateinit var termContainer: FrameLayout
-    private lateinit var statusView: TextView
     private lateinit var tabBar: ComposeView
     // round 21: keys-bar modifier (CTRL/⇧) — ตัวเดียวทั้ง activity, แปลง input ทุกทางของ active pane
     private val mods = KeyModifierState()
@@ -120,15 +122,40 @@ class MainActivity : ComponentActivity() {
     private val lru = PaneLru<TerminalSession>(cap = 5)
     private val tabViews = HashMap<Long, TabViews>()
 
-    // snapshot ที่ Compose tab strip read — refreshTabs() เป็นผู้เขียนอย่างเดียว
+    // snapshot ที่ Compose top bar read — refreshTabs() เป็นผู้เขียนอย่างเดียว
     private var tabSnap by mutableStateOf(listOf<TabInfo>())
     private var activeTabId by mutableStateOf(0L)
+    // task 7 (round 23): status line ของ strip เดิมย้ายเข้า top bar v2 (single row) —
+    // pair (text, argb) เขียนผ่าน setStatus เท่านั้น; barSnap = input ของเมนู ∨/⋮ เขียนโดย refreshTabs
+    private var statusSnap by mutableStateOf("≡ new tab — tap to connect" to 0xFF9A9A9AL)
+    private var barSnap by mutableStateOf(TopBarSnapshot(emptyList(), null, false, "webview", true))
+
+    // round 23 amendment (Update Check)
+    private var appVersion: String = "?" // versionName ดิบ — CrashLog pattern เดียว (packageManager, ไม่ใช่ BuildConfig)
+    private var pendingUpdate: List<UpdateCheck.Release>? = null // ผล auto ที่มาตอน background → show ตอน onResume (Q11)
+    private var updateCheckInFlight = false // กัน double-tap ⋮ = สอง dialog
+    private var updateCheckManualQueued = false // F2: manual ซ้อนตอน in-flight = ตอบแบบ manual เมื่อผลกลับ
+
+    /** input ของเมนู ∨/⋮ — snapshot เดียวกับ tabSnap (เขียนโดย refreshTabs เท่านั้น) */
+    private data class TopBarSnapshot(
+        val profiles: List<String>,
+        val activeProfile: String?,
+        val keepCpuAwake: Boolean,
+        val engine: String,
+        val updateChecks: Boolean, // round 23 amendment: label สวิตช์ 🌐 ใน ⋮ (F8: ไม่มี default — source of truth เดียว = Settings ผ่าน refreshTabs)
+        // task 9: สี chrome ตาม scheme ของ pane active — คำนวณครั้งเดียวต่อ snapshot (ChromePalette)
+        // ค่า default = fallback ตอน boot ก่อน pane แรก (≡ สี hard-code ยุค task 7)
+        val chrome: ChromeColors = ChromeColors(),
+    )
 
     // divider drag state (pointer เดียว — field ง่ายกว่า tag)
     private var dragFrac0 = 0.5f
     private var dragAxis0 = 0f
 
     internal var settings = Settings()
+    // ADR 0002 (round 23): Back-as-Escape — callback เดียวทั้ง app, isEnabled mirror settings.backAsEscape
+    // (sync ทุก funnel ที่ settings เปลี่ยน — ดู syncBackAsEscape; watcher callback วิ่งบน main = ปลอดภัย)
+    private var backCallback: OnBackPressedCallback? = null
     // T4 (round 13): snapshot write debounce — force-stop ไม่เรียก onDestroy เลย, debounce บ่อยคือ gate จริง
     private val restoreWrite = Runnable { flushSnapshotNow() }
     private val restoreHandler = android.os.Handler(android.os.Looper.getMainLooper())
@@ -159,6 +186,7 @@ class MainActivity : ComponentActivity() {
         SshBackend.setHomeFolder(filesDir) // MINA บน Android ไม่มี user.home — ต้อง set ก่อน client แรก
         connectUi = ConnectUi(this)
         settingsUi = SettingsUi(this)
+        appVersion = runCatching { packageManager.getPackageInfo(packageName, 0).versionName }.getOrNull() ?: "?"
         settings = loadSettings()
         // reload-on-change (round 6): ไฟล์ถูกแก้จากข้างนอก (run-as/import ภายนอก) = reparse, session เดิมไม่ reconnect
         settingsWatcher = SettingsWatcher(File(filesDir, "settings.json")) { text ->
@@ -166,6 +194,7 @@ class MainActivity : ComponentActivity() {
                 SettingsSync.Decision.Reload -> {
                     runCatching { SettingsLoader.parse(text) }.onSuccess {
                         settings = it
+                        syncBackAsEscape() // ADR 0002: external edit ของ backAsEscape ต้องมีผลทันที
                         refreshTabs()
                         renderActiveStatus()
                         rebuildKeybindings()   // chord table ใหม่ถึงทุก WebView ทันที (gate G5)
@@ -173,6 +202,8 @@ class MainActivity : ComponentActivity() {
                         for (id in manager.ids()) manager.get(id)?.let { tab ->
                             for (p in tab.panes) if (p.native) configureNative(p, p.profile?.fontFace)
                         }
+                        applyKeysPreset() // ADR 0002: keysPreset เปลี่ยน = body ของ bar ถูก lay ใหม่ทันที
+                        applyKeysBars()
                         toast("settings reloaded")
                     }
                 }
@@ -181,6 +212,25 @@ class MainActivity : ComponentActivity() {
             }
         }
         settingsWatcher?.start()
+        // ADR 0002 (round 23): Back-as-Escape — enabled ≡ settings.backAsEscape (syncBackAsEscape keeps it live).
+        // Dialog ไม่ต้องเช็ค — consume Back ก่อน activity อยู่แล้ว. ESC ร่อนเข้า path เดียวกับปุ่ม ⎋ (routeKey)
+        // จึงข้าม markMode divert ไม่เป็น — ADR 0001 guard: ห้ามเพิ่ม call revealIme ที่ตรงนี้เด็ดขาด
+        onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(settings.backAsEscape) {
+            override fun handleOnBackPressed() {
+                when (BackPolicy.decide(settings.backAsEscape, imeUp, activePane() != null)) {
+                    EscOrSystem.Esc -> routeKey(ExtraKeysBar.ESC)
+                    EscOrSystem.System -> { // ปลดตัวเองชั่วคราวให้ dispatcher ลงถึง default (ปิดแอป) แล้วติดกลับ
+                        // parked (i): try/finally — callback อื่นที่ throw กลาง stream ห้ามทิ้ง callback นี้ไว้ในสถานะ disabled ถาวร
+                        isEnabled = false
+                        try {
+                            onBackPressedDispatcher.onBackPressed()
+                        } finally {
+                            isEnabled = true
+                        }
+                    }
+                }
+            }
+        }.also { backCallback = it })
         rebuildKeybindings()   // สร้างตารางแรก (ยังไม่ WebView = set field อย่างเดียว; onPageFinished จะ push)
         imm = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
         run { // slop/longpress ของระบบ = เกณฑ์ TapGate (≡ viewConfiguration ที่ TouchKernel ฝั่ง native ใช้)
@@ -194,15 +244,18 @@ class MainActivity : ComponentActivity() {
 
         root = GestureRoot(this) { ev -> observeGesture(ev) }.apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(0xFF0C0C0C.toInt())
+            setBackgroundColor(0xFF0C0C0C.toInt()) // boot fallback ก่อน refreshTabsครั้งแรก (applyChrome ทา scheme ทับ)
+            // task 8: pinch แทนปุ่ม A± (round 23) — path เดียวกับ zoom() จึง persist ต่อ profile เหมือนเดิม
+            onPinch = { dir -> onPinchStep(dir) }
         }
 
         // ComposeView ต้องการ owners บน view tree (เราไม่ใช้ activity-compose setContent ทั้งจอ)
         root.setViewTreeLifecycleOwner(this)
         root.setViewTreeSavedStateRegistryOwner(this)
 
+        // top bar v2 (round 23): แถวเดียว — pills/single-title + ∨ picker + ⋮ overflow (แทน status strip สองแถวเดิม)
+        // task 9: ไม่มี bg hard-code — applyChrome (จาก refreshTabs) ทา scheme bg ให้ทั้ง root + แถบนี้
         tabBar = ComposeView(this).apply {
-            setBackgroundColor(0xFF0C0C0C.toInt())
             isFocusable = false
             isFocusableInTouchMode = false
             setContent {
@@ -210,52 +263,34 @@ class MainActivity : ComponentActivity() {
                     tabs = tabSnap,
                     activeId = activeTabId,
                     onSelect = { switchTab(it) },
-                    onNew = { connectUi.showProfileList() },
+                    onNewFromProfile = { name -> newTabFromProfileName(name) },
+                    onAddProfile = { connectUi.showAddForm() },
+                    onOverflow = { runOverflow(it) },
+                    chrome = barSnap.chrome,
+                    profiles = barSnap.profiles,
+                    activeProfileName = barSnap.activeProfile,
+                    onProfileEdit = { connectUi.editProfileOf(activePane()?.profile) },
+                    onProfileDelete = { connectUi.deleteProfileOf(activePane()?.profile) },
+                    onStatusTap = { statusTap() },
+                    onStatusLongPress = { statusLongPress() },
+                    keepCpuAwake = barSnap.keepCpuAwake,
+                    engine = barSnap.engine,
+                    updateChecks = barSnap.updateChecks,
+                    appVersion = appVersion, // static ต่อ process — ไม่อยู่ใน snapshot ก็ได้ (ไม่ recompose ต้องการ)
+                    statusText = statusSnap.first,
+                    statusColor = androidx.compose.ui.graphics.Color(statusSnap.second),
                     onClose = { closeTab(it) },
                     onMenu = { showPaneMenu(it) },
+                    onBeforeMenu = { closeImeForMenus() }, // task 10: ∨/⋮ ก็เป็น menu — ปิด IME ก่อนเหมือนกัน
                 )
             }
         }
         root.addView(tabBar, LinearLayout.LayoutParams(-1, LinearLayout.LayoutParams.WRAP_CONTENT))
-
-        statusView = TextView(this).apply {
-            text = "≡ new tab — tap to connect"
-            setTextColor(0xFF9A9A9A.toInt())
-            setBackgroundColor(0xFF1F1F1F.toInt())
-            setPadding(dp(10), dp(6), dp(6), dp(6))
-            textSize = 12f
-            setOnClickListener {
-                val s = activePane()
-                val p = s?.profile
-                // IDLE + มี profile = กด Disconnect all ไว้ แตะแล้วต่อ pane เดิม ไม่เปิด tab ใหม่
-                if (s != null && p != null && (s.error != null || s.controller.state == SessionController.State.DISCONNECTED ||
-                        s.controller.state == SessionController.State.IDLE)) {
-                    // T3: tap ระหว่าง countdown = "retry ตอนนี้" — ยกเลิกคิวกัน dial ซ้ำสองรอบ
-                    cancelReconnect(s)
-                    startConnect(s, p) // tap = retry บน pane เดิม (ไม่เปิดใหม่)
-                } else connectUi.showProfileList()
-            }
-            // T3: long-press = ปิด auto-reconnect ของ pane นี้จน CONNECTED ใหม่ (user อนุมัติ)
-            setOnLongClickListener {
-                val s = activePane() ?: return@setOnLongClickListener false
-                cancelReconnect(s)
-                s.reconnect.userStop()
-                if (s === activePane()) renderActiveStatus()
-                true
-            }
-        }
-        val strip = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        strip.addView(statusView, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-        val zoomOutBtn = stripButton("A−") { zoom(-2) }
-        // HW-5b: user เครื่องจริงเป็น SSH node ไม่มี USB/วง network เดียวกับมือถือ = adb logcat เข้าไม่ถึง →
-        // long-press "A−" = export ATermIme ring → clipboard (paste ส่งได้เลย)
-        // 2026-11-04 user อนุมัติ: เปิดใน release ด้วย (เดิม debug-only — เจอจริง: Honor ที่ลง release แตะแช่แล้วเงียบ;
-        // ring มีแต่ IME transition ไม่มี secret) — *ซ่อน* เหมือนเดิม ห้ามย้ายเข้าเมนู visible
-        zoomOutBtn.setOnLongClickListener { exportImeLog(); true }
-        strip.addView(zoomOutBtn)
-        strip.addView(stripButton("A+") { zoom(2) })
-        strip.addView(stripButton("⚡") { pasteNow(fromClipboard = true) })
-        root.addView(strip, LinearLayout.LayoutParams(-1, -2))
+        // task 7: status strip (TextView + A−/A+/⚡) ถูกลบ — gesture เดิมย้ายเข้า top bar (statusTap/statusLongPress),
+        // action ของปุ่ม(strip) → ⋮ overflow (runOverflow)
+        // ⚡ paste = ปุ่ม KeyKind.app ใน KeyPresets.default/compact (ตำแหน่ง 4 หลัง ⌃C — fix wave 1 เพิ่ม; task 7
+        // เคยอ้างว่า "shipped" ทั้งที่ preset ไม่มีปุ่ม = ไม่มีทางเข้าจริง, final review A1) — จอแคบ fold อาจยุบ ⚡
+        // เข้า popup ⋯ (tap เดียว) — routeKey("app:paste") → pasteNow(fromClipboard=true)
 
         termContainer = FrameLayout(this)
         root.addView(termContainer, LinearLayout.LayoutParams(-1, 0, 1f))
@@ -273,6 +308,7 @@ class MainActivity : ComponentActivity() {
             }
         }
         keysBar = ExtraKeysBar(this, mods,
+            layout = KeyPresets.byName(settings.keysPreset), // ADR 0002: preset จาก Settings (unknown → default)
             onKey = { key -> routeKey(key) },
             onKeyboardToggle = { toggleKeyboard() }) // Manual Reveal (ADR 0001): ⌨ = ทาง reveal เดียว
         root.addView(keysBar)
@@ -302,6 +338,17 @@ class MainActivity : ComponentActivity() {
             keysBar.setImeUp(up) // ⌨ pinned = viewer ของสถานะจริง — ห้ามมี state ค้างในปุ่ม (ADR 0001)
             miniBar.setImeUp(up)
             applyKeysBars()
+        }
+        // round 23 task 6 (ADR 0002 edge-to-edge): bottom inset เป็นของ keysBar — root ไม่กันล่างตอน IME ปิด
+        // → bar (โปร่งใส = root bg ที่วาดต่อถึงขอบกายภาพ) ลามใต้ gesture pill, bottom padding ของ bar ยกปุ่มเหนือ pill
+        // ต้องคง padding แนวนอน (Gesture Gutter 24dp —กฎใน ExtraKeysBar: ห้าม hard-code start=0 ที่อื่น)
+        keyboardWatcher.onInsets = { barsBottom, imeBottom ->
+            // barsVisible อ่านจาก visibility ที่ applyKeysBars เขียนเท่านั้น (single writer — ห้ามคำนวณ hidden ใหม่ที่นี่)
+            val barsVisible = keysBar.visibility != View.GONE || miniBar.visibility != View.GONE
+            val barBottom = BarInsets.barBottom(imeBottom > 0, barsBottom, barsVisible)
+            if (keysBar.paddingBottom != barBottom) {
+                keysBar.setPadding(keysBar.paddingLeft, keysBar.paddingTop, keysBar.paddingRight, barBottom)
+            }
         }
         keyboardWatcher.start()
         setContentView(root)
@@ -369,6 +416,15 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         ConnectionLog.d("activity onResume")
+        // Q11: auto notice ที่ผลกลับตอน background = เด้งทันทีที่ foreground (pending ใน memory เท่านั้น —
+        // process ตายก่อน show = ไม่ mark dismissed, throttle 24h ผ่านแล้วจะเช็คเจอใหม่ = delay ไม่ใช่ของหาย)
+        // F5: อ่าน opt-out ตอน show — toggle Off ระหว่าง fetch = ต้องไม่ฝืนเด้ง
+        pendingUpdate?.let { if (settings.updateChecks) showUpdateNotice(it) else pendingUpdate = null }
+        // F1 (review): auto check อยู่ onResume ไม่ใช่ onCreate — FGS ฆ่า process ยาก (session อยู่ได้เป็นวัน/สัปดาห์)
+        // = onCreate-only จะไม่มีวันเช็ครอบสอง; throttle 1×/วัน (shouldAutoCheck) เป็น scheduler เอง — resume ถี่ไม่ spam
+        if (UpdateCheck.shouldAutoCheck(settings.updateChecks, settings.lastUpdateCheckAt, System.currentTimeMillis())) {
+            checkUpdates(manual = false)
+        }
     }
 
     override fun onPause() {
@@ -423,14 +479,33 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    /**
+     * ADR 0002 round 23: `keysPreset` = preset reference ของ body bar (pinned zone ไม่เกี่ยว)
+     * เรียกเฉพาะ path reload (SettingsWatcher) — onCreate ส่ง layout เข้า constructor ตรง ๆ
+     * (watcher ถูก start ก่อน keysBar ถูกสร้างใน onCreate เดียวกัน — callback รันทีหลังเสมอ แต่ guard ไว้กัน timeline เพี้ยน)
+     */
+    private fun applyKeysPreset() {
+        if (this::keysBar.isInitialized) keysBar.setLayout(KeyPresets.byName(settings.keysPreset))
+    }
+
     /** กฎ C12 (ผู้ใช้เคาะ): mini bar เฉพาะ landscape + IME เปิด && ไม่ได้กด "⋯" — portrait ไม่มีวันเปลี่ยน */
     private fun applyKeysBars() {
+        // round 23 task 5: toggle auto-hide (default OFF) — เสียบ physical keyboard แล้ว bar on-screen ไม่จำเป็น
+        // การซ่อนอยู่ *ใน* funnel นี้ = ทุก caller (SettingsWatcher reload, preset reload, IME, rotate) ได้ผลตามเอง
+        val hidden = settings.hideKeysBarOnHardwareKeyboard && hwKeyboardPresent()
         val landscape = resources.configuration.orientation ==
             android.content.res.Configuration.ORIENTATION_LANDSCAPE
-        val mini = imeUp && landscape && !forceFullKeys
-        keysBar.visibility = if (mini) View.GONE else View.VISIBLE
+        val mini = !hidden && imeUp && landscape && !forceFullKeys
+        keysBar.visibility = if (mini || hidden) View.GONE else View.VISIBLE
         miniBar.visibility = if (mini) View.VISIBLE else View.GONE
+        // final review A2: สอง bar GONE พร้อมกัน (hw-kb auto-hide) = root ต้องกันล่างเอง —
+        // funnel เดียวที่ตัดสิน visibility ส่งสถานะเข้า watcher (root padding ยังเป็นของ listener ตัวเดียว, T3)
+        keyboardWatcher.barsVisible = keysBar.visibility != View.GONE || miniBar.visibility != View.GONE
     }
+
+    /** ≡ เกณฑ์ hwKb ของ back-as-escape — NOKEYS = ไม่มี physical keyboard (emulator รายงาน QWERTY = present จริง) */
+    private fun hwKeyboardPresent() =
+        resources.configuration.keyboard != android.content.res.Configuration.KEYBOARD_NOKEYS
 
     /**
      * round 15-HW: จุดเดียวที่ส่ง font เข้า webview — fontSize + fontFace (เดิม face ไม่เคยข้าม bridge
@@ -502,8 +577,11 @@ class MainActivity : ComponentActivity() {
         if (!imeUp) { revealIme(s); return }
         imeUserRequested = false // user สั่งปิด — protection สิ้นสุดทันที (transition up→down cleanup ตามปกติ)
         closeFocusValveAllPanes()
+        // parked (z): served-token consistency ≡ closeImeForMenus — hide และ restartInput ต้องเกาะ pane
+        // เดียวกัน (imeServedPane ก่อน fallback activePane) ไม่งั้น split ที่ IME เกาะ pane เก่า =
+        // hide ยิง token ของ active (อาจไม่ตรงกับผู้ถือ IC) ขณะที่ restartInput ลบ viewClicked คนละ pane
         val served = imeServedPane ?: s // pane ที่ IME เกาะจริง (split อาจไม่ตรงกับ activePane)
-        val token = (s.webView ?: s.view).windowToken ?: return
+        val token = (served.webView ?: served.view).windowToken ?: return
         runCatching { imm?.hideSoftInputFromWindow(token, 0) }
             .onFailure { imeLog("btn hide fail: ${it.message}") } // convention: ห้าม swallow เงียบ
         runCatching { imm?.restartInput(served.webView ?: served.view) } // ลบ viewClicked ของ pane ที่เคย serve
@@ -604,11 +682,12 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // HW-5b: ring ของ ATermIme (cap ~400) — export ผ่าน long-press "A−" ทุก build (user อนุมัติ 2026-11-04)
+    // HW-5b: ring ของ ATermIme (cap ~400) — export ได้ทุก build (user อนุมัติ 2026-11-04)
+    // round 23 task 7: ทางเข้า = ⋮ "Copy IME log" (เดิม long-press "A−" บน status strip ที่ถูกลบ)
     private val imeRing = ArrayDeque<String>()
 
     private fun imeLog(msg: String) {
-        // ring บันทึกทุก build (release ต้องมีข้อมูลให้ A− export); logcat เฉพาะ debuggable เท่านั้น
+        // ring บันทึกทุก build (release ต้องมีข้อมูลให้ ⋮ export); logcat เฉพาะ debuggable เท่านั้น
         if (debugImeLog) android.util.Log.d("ATermIme", msg)
         val line = "${android.os.SystemClock.uptimeMillis()} $msg" // timebase เดียวกับ IME UP/DOWN @ms
         synchronized(imeRing) {
@@ -664,6 +743,28 @@ class MainActivity : ComponentActivity() {
         runCatching { imm?.hideSoftInputFromWindow(token, 0) }
         runCatching { imm?.restartInput(s.webView ?: s.view) }
         imeLog("hold-hide ${s.hashCode()}")
+    }
+
+    /**
+     * round 23 task 10 (ADR 0001 + 0002): เปิดเมนู/dialog = user สั่งปิด IME เอง — composite ของ
+     * ฝั่ง hide ใน toggleKeyboard (protection สิ้นสุด → ปิดวาล์วทุก pane → hide → restartInput กัน
+     * vendor stack เปิดกลับ) + EditText guard เดียวกับ closeImeForSelection (find bar/dialog field
+     * มี IME flow ของตัวเอง ห้ามแย่ง; profile form ที่ user tap field เองเปิด IME ใหม่ได้ตามปกติ)
+     * ADR 0001-clean: fun นี้ปิดอย่างเดียว — จากนี้ IME เกิดได้ทาง revealIme/user-tap-field เท่านั้น,
+     * menu/dialog ห้าม auto-reopen; KeyPopup ที่ focusable แล้วได้ผลเดียวกันโดย popup window ฉก focus (ตั้งใจ)
+     * caller: ทุก show-entry ใน ConnectUi + TabBar ∨/⋮ ผ่าน onBeforeMenu
+     */
+    internal fun closeImeForMenus() {
+        if (currentFocus is android.widget.EditText) return
+        imeUserRequested = false // menu = user-requested close — protection สิ้นสุดทันที
+        closeFocusValveAllPanes()
+        val served = imeServedPane ?: activePane() ?: return
+        val token = (served.webView ?: served.view).windowToken ?: return
+        runCatching { imm?.hideSoftInputFromWindow(token, 0) }
+            .onFailure { imeLog("menu hide fail: ${it.message}") } // convention: ห้าม swallow เงียบ
+        runCatching { imm?.restartInput(served.webView ?: served.view) }
+            .onFailure { imeLog("menu restartInput fail: ${it.message}") }
+        imeLog("hide for menu ${served.hashCode()}")
     }
 
     /**
@@ -948,9 +1049,17 @@ class MainActivity : ComponentActivity() {
         tv.keymap = keyTable // T4
         tv.onAppAction = { runAction(it) } // chord APP-target ≡ Droid.onAction → runAction เดิม (fail-soft toast ในนั้น)
         tv.onGridResize = { c, r ->
+            // round 23 T5 permanent diagnostic: grid vs pty on every resize — a real device can settle
+            // the field hypothesis "pty was told cols > grid" (tmux SIGWINCH race) from `adb logcat -s AtermResize`
+            Log.i("AtermResize", "native grid ${c}x${r} pty ${s.cols}x${s.rows}")
             s.cols = c; s.rows = r
             s.controller.resize(c, r)
-            runOnUiThread { if (s === activePane()) renderActiveStatus() }
+            runOnUiThread {
+                // review fix (task 7): TabInfo.cols/rows + header "name (W×H)" เป็น snapshot —
+                // ทุก writer ของ s.cols/s.rows ต้อง refreshTabs ด้วย (resize ไม่ใช่ hot-path)
+                refreshTabs()
+                if (s === activePane()) renderActiveStatus()
+            }
         }
         holder[0] = s
         s.pageReady = true // ไม่มี page load — พร้อม connect ได้ทันที (pendingConnect จะ flush เอง)
@@ -1079,6 +1188,15 @@ class MainActivity : ComponentActivity() {
      * routeKey คืนทางเดิมเมื่อ mode ปิด — ExtraKeysBar/MiniKeysBar internals ไม่โดนแตะ (seam lambda เดิม)
      */
     private fun routeKey(key: String) {
+        // ADR 0002 task 4: ปุ่ม app-kind ของ bar = sentinel "app:<id>" — ต้องเบรก *ก่อน* mods.transform
+        // (transform fail-soft กับ multi-char = "app:paste" จะถูกพิมพ์ลง PTY ตรง ๆ ถ้าหลุดผ่าน)
+        if (key.startsWith(ExtraKeysBar.APP_ACTION_PREFIX)) {
+            when (key.removePrefix(ExtraKeysBar.APP_ACTION_PREFIX)) {
+                "paste" -> pasteNow(fromClipboard = true)
+                else -> Unit // id อื่น/อนาคต = silent, ห้ามแตะ PTY (bar ส่ง raw, behavior เป็นของฝั่ง app)
+            }
+            return
+        }
         val s = activePane() ?: return
         // round 21: modifier (CTRL/⇧ ค้างหรือ latch) แปลงทุก byte จาก bar — funnel เดียวกับที่ Gboard ใช้
         val t = mods.transform(key)
@@ -1181,6 +1299,7 @@ class MainActivity : ComponentActivity() {
         applyPaneVisuals(tid)
         focusTerminal(s)
         renderActiveStatus()
+        refreshTabs() // parked (v): chrome/bar อ่าน scheme จาก pane focused — in-tab focus เปลี่ยนต้องตามด้วย (single writer เดิม)
         scheduleSnapshotWrite() // T4: focused pane เปลี่ยน = snapshot ต้องตาม
     }
 
@@ -1348,6 +1467,7 @@ class MainActivity : ComponentActivity() {
 
     /** long-press pill → เมนู (trigger ที่ user เคาะ); ชื่อทุกข้อ trace WT schema (Panes.kt) */
     private fun showPaneMenu(tabId: Long) {
+        closeImeForMenus() // task 10 menu policy — pane menu ก็เป็น dialog (IME ปิดก่อน, ห้ามทับเมนู)
         if (manager.get(tabId) == null) return
         switchTab(tabId)                        // สลับไป tab ที่ user ชี้ก่อน แล้วค่อยออกคำสั่งกับมัน
         val tab = activeTab() ?: return
@@ -1370,9 +1490,17 @@ class MainActivity : ComponentActivity() {
             if (s?.native == true) (s.view as? TerminalView)?.toggleMark() // T7 native path
             else s?.js("window.AtermKeys && AtermKeys.toggle();")
         }
+        // review fix (task 7): single-tab ไม่มี long-press บน status text แล้ว — "stop auto-reconnect"
+        // ของ strip เดิมจึงมาเป็น item เฉพาะตอน pane นี้กำลัง countdown (body เดียวกับ statusLongPress)
+        val foc = tab.focusedPane()
+        if (foc != null && foc.reconnectJob?.isActive == true) {
+            items += "⏹  Stop reconnect" to { statusLongPress() }
+        }
         items += "Close tab" to { closeTab(tabId) }
+        // task 7: header line "name (146×36)" — ข้อมูล grid ที่ strip เดิมแสดง ย้ายมาอยู่ตรงนี้
+        val grid = if (foc != null && foc.cols > 0 && foc.rows > 0) " (${foc.cols}×${foc.rows})" else ""
         android.app.AlertDialog.Builder(this)
-            .setTitle("Pane — ${tab.focusedPane()?.profile?.name ?: "new tab"}")
+            .setTitle("${foc?.profile?.name ?: "new tab"}$grid")
             .setItems(items.map { it.first }.toTypedArray()) { d, w -> d.dismiss(); items[w].second() }
             .showGuarded(this)
     }
@@ -1449,13 +1577,44 @@ class MainActivity : ComponentActivity() {
                     else -> foc?.controller?.state ?: SessionController.State.IDLE
                 },
                 error = tab.panes.any { it.error != null },
+                // task 7: grid ของ pane focused → long-press header "name (146×36)" (webview: onResize,
+                // native: onGridResize เป็นผู้เขียน s.cols/rows — data flow เดียวกับ strip เดิม)
+                cols = foc?.cols ?: 0,
+                rows = foc?.rows ?: 0,
             )
         }
         activeTabId = manager.activeId
+        // task 7: input ของเมนู ∨/⋮ เขียนรอบเดียวกัน (toggle/save/delete ล้วนผ่าน refreshTabs — single writer)
+        // parked (n): filter ผ่าน Settings.visibleProfiles() แหล่งเดียวกับ ConnectUi (ห้าม filterNot ซ้ำที่นี่)
+        val visible = settings.visibleProfiles()
+        // task 9: chrome ตาม scheme ของ pane active — lookup เดียว paletteFor (ห้าม path ที่สอง, ดู KDoc มัน);
+        // คำนวณตรงนี้ครั้งเดียวต่อ snapshot ไม่ใช่ตอน recompose (statusText recompose ทั้งแถบ ~1 Hz)
+        val pal = paletteFor(activePane()?.profile)
+        barSnap = TopBarSnapshot(
+            profiles = visible.map { it.name ?: it.guid ?: "?" },
+            activeProfile = activePane()?.profile?.name,
+            keepCpuAwake = settings.keepCpuAwake,
+            engine = settings.engine,
+            updateChecks = settings.updateChecks,
+            chrome = ChromePalette.from(pal.defaultBg, pal.defaultFg),
+        )
+        applyChrome(barSnap.chrome)
         window.decorView.keepScreenOn = tabViews.values.any { tv ->
             tv.slots.any { it?.controller?.state == SessionController.State.CONNECTED }
         }
         syncKeepAlive()
+    }
+
+    /**
+     * task 9: ดัน chrome เข้า view ที่ Compose access ไม่ถึง — root (เนื้อรอบ ๆ/ใต้ bar) + ตัว ComposeView
+     * เอง (padding area) + Keys Bar; barBg ≡ terminal bg ทำให้แถบละลายนี่งกับขอบ pane (anchor เดียวที่เป๊ะ)
+     * ผู้เรียกเดียว = refreshTabs (single writer ของ snapshot — ทุก path สลับ tab/save/reload ผ่านที่นี่)
+     */
+    private fun applyChrome(c: ChromeColors) {
+        val bg = c.barBg.toArgb()
+        root.setBackgroundColor(bg)
+        tabBar.setBackgroundColor(bg)
+        keysBar.setChrome(c)
     }
 
     private fun syncKeepAlive() {
@@ -1489,6 +1648,7 @@ class MainActivity : ComponentActivity() {
     internal fun toggleEngine() {
         settings = settings.copy(engine = RendererToggle.next(settings.engine))
         persistSettings()
+        refreshTabs() // task 7: label "Renderer: …" ใน ⋮ อ่านจาก barSnap
         toast(if (settings.engine == "native") "New panes use the native engine" else "New panes use WebView")
     }
 
@@ -1496,7 +1656,95 @@ class MainActivity : ComponentActivity() {
         settings = settings.copy(keepCpuAwake = !settings.keepCpuAwake)
         persistSettings()
         syncKeepAlive()
+        refreshTabs() // task 7: label "Keep CPU awake" ใน ⋮ อ่านจาก barSnap
         toast(if (settings.keepCpuAwake) "CPU stays awake while connected. Uses more battery." else "CPU may sleep while the screen is off")
+    }
+
+    // ---- Update Check (round 23 amendment) ----
+
+    private fun toggleUpdateChecks() {
+        settings = settings.copy(updateChecks = !settings.updateChecks)
+        persistSettings()
+        refreshTabs() // label 🌐 ใน ⋮ อ่านจาก barSnap
+        toast(if (settings.updateChecks) "Update checks on — GitHub Releases, once a day" else "Update checks off — check manually anytime")
+    }
+
+    /**
+     * funnel เดียวของ manual+auto (Q1/Q3): fetch → persist stamp (ทุกผล รวม fail — auto ไม่ retry รัว) →
+     * manual: toast เสมอ / auto: เด้งเมื่อ shouldNotify, background = pending (Q11)
+     */
+    private fun checkUpdates(manual: Boolean) {
+        if (updateCheckInFlight) {
+            // F2 (review): manual ระหว่าง auto in-flight = คำตอบต้องไม่ถูกกลืน — จำไว้ ตอบแบบ manual ตอนผลกลับ
+            if (manual) updateCheckManualQueued = true
+            return
+        }
+        if (UpdateCheck.parseVersion(appVersion) == null) {
+            // F3 (review): อ่าน version ตัวเองไม่ได้ = ไม่มี baseline — ห้ามตอบ "up to date" หลอก user
+            ConnectionLog.d("update check skipped unparseable versionName")
+            if (manual) toast("Couldn't check for updates")
+            return
+        }
+        updateCheckInFlight = true
+        updateCheckManualQueued = false
+        val stamp = System.currentTimeMillis()
+        lifecycleScope.launch {
+            val outcome = withContext(Dispatchers.IO) {
+                runCatching {
+                    UpdateCheck.eligibleNewer(UpdateCheck.parseReleases(UpdateCheck.fetch(UpdateCheck.FEED_URL)), appVersion)
+                }
+            }
+            updateCheckInFlight = false
+            val answered = manual || updateCheckManualQueued // F2: auto ที่ถูก manual มาถามซ้อน = นับเป็น manual
+            updateCheckManualQueued = false
+            settings = settings.copy(lastUpdateCheckAt = stamp)
+            persistSettings()
+            outcome
+                .onSuccess { newer ->
+                    ConnectionLog.d("update check ok newer=${newer.map { it.tag }}")
+                    when {
+                        newer.isEmpty() -> if (answered) toast("You're up to date (v$appVersion)")
+                        answered -> showUpdateNotice(newer) // manual = user ถามเอง — ไม่เคารพ dismissed
+                        settings.updateChecks && UpdateCheck.shouldNotify(newer.first().tag, settings.dismissedUpdateTag) ->
+                            // F5: อ่าน opt-out ตอนผลกลับ — toggle Off ระหว่าง fetch = ต้องไม่เด้ง
+                            if (lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED)) showUpdateNotice(newer)
+                            else pendingUpdate = newer
+                        else -> Unit // dismissed release เดิม / opt-out = เงียบ (ครั้งเดียวต่อ release, Q2)
+                    }
+                }
+                .onFailure {
+                    ConnectionLog.d("update check failed ${it.javaClass.simpleName}")
+                    if (answered) toast("Couldn't check for updates — check your connection")
+                }
+        }
+    }
+
+    /**
+     * Update Notice: mark dismissed **เมื่อดialogขึ้นจริงเท่านั้น** (F6: showGuarded ทิ้ง dialog
+     * ตอน activity ตาย = ยังไม่เคยเห็น release นี้ ห้ามเงียบตลอดไป — ครั้งถัดไปได้);
+     * View release = เปิดหน้า release ใน browser (ทางติดตั้งเดียว, Q4-ก) — ไม่มี in-app installer
+     */
+    private fun showUpdateNotice(newer: List<UpdateCheck.Release>) {
+        pendingUpdate = null
+        val top = newer.first()
+        closeImeForMenus() // policy task 10: dialog ทุกตัวจาก path นี้ปิด IME ก่อนเหมือนกัน
+        val body = UpdateCheck.cumulativeChangelog(newer)
+        val shown = android.app.AlertDialog.Builder(this)
+            .setTitle("Update available — ${top.tag}")
+            .setMessage(if (body.isBlank()) "No release notes." else body)
+            .setPositiveButton("View release") { _, _ -> openReleaseUrl(top.url) }
+            .setNegativeButton("Later", null)
+            .showGuarded(this)
+        if (shown != null) { // F6: mark = เคยเห็นแล้ว (ครั้งเดียวต่อ release ไม่ว่าตอบปุ่มไหน)
+            settings = settings.copy(dismissedUpdateTag = top.tag)
+            persistSettings()
+        }
+    }
+
+    private fun openReleaseUrl(url: String) {
+        if (url.isEmpty()) { toast("no release link"); return }
+        runCatching { startActivity(Intent(Intent.ACTION_VIEW, android.net.Uri.parse(url))) }
+            .onFailure { toast("no browser app found") }
     }
 
     /** ปุ่มบน notification: ปิดทุก pane แต่คง tab ไว้ ให้แตะ status bar เพื่อต่อใหม่ได้ */
@@ -1953,7 +2201,14 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    /**
+     * ADR 0002: isEnabled ของ back callback ต้องตาม settings.backAsEscape ทันที — ทุก in-app mutation
+     * ผ่าน persistSettings เป็น funnel เดียว (reload ที่ watcher เป็นอีกทาง, sync ที่นั่นด้วย)
+     */
+    private fun syncBackAsEscape() { backCallback?.isEnabled = settings.backAsEscape }
+
     private fun persistSettings() {
+        syncBackAsEscape() // สลับ flag จาก settings UI = มีผลกับปุ่ม Back ทันที ไม่ต้อง restart
         runCatching {
             val text = SettingsLoader.render(settings)
             lastSettingsHash = SettingsSync.sha256(text)   // ต้อง set ก่อน watcher เห็นไฟล์
@@ -2050,9 +2305,56 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    // task 7: status line เดิม = TextView ตอนนี้ = snapshot ที่ top bar v2 read (single-row chrome)
     private fun setStatus(text: String, color: Int) = runOnUiThread {
-        statusView.text = text
-        statusView.setTextColor(color)
+        statusSnap = text to (color.toLong() and 0xFFFFFFFFL)
+    }
+
+    /** gesture เดิมของ status strip: tap = retry บน pane เดิมเมื่อ IDLE/DISCONNECTED/error, ไม่งั้น = picker */
+    private fun statusTap() {
+        val s = activePane()
+        val p = s?.profile
+        // IDLE + มี profile = กด Disconnect all ไว้ แตะแล้วต่อ pane เดิม ไม่เปิด tab ใหม่
+        if (s != null && p != null && (s.error != null || s.controller.state == SessionController.State.DISCONNECTED ||
+                s.controller.state == SessionController.State.IDLE)) {
+            // T3: tap ระหว่าง countdown = "retry ตอนนี้" — ยกเลิกคิวกัน dial ซ้ำสองรอบ
+            cancelReconnect(s)
+            startConnect(s, p) // tap = retry บน pane เดิม (ไม่เปิดใหม่)
+        } else connectUi.showProfileList()
+    }
+
+    /** T3: long-press = ปิด auto-reconnect ของ pane นี้จน CONNECTED ใหม่ (user อนุมัติ — gesture เดิมของ strip) */
+    private fun statusLongPress() {
+        val s = activePane() ?: return
+        cancelReconnect(s)
+        s.reconnect.userStop()
+        if (s === activePane()) renderActiveStatus()
+    }
+
+    /** ∨ picker → ความหมายเดิมของ connectProfile: pane ว่าง = ใช้ตัวเดิม, ไม่ว่าง = tab ใหม่ */
+    private fun newTabFromProfileName(name: String) {
+        val p = settings.visibleProfiles().firstOrNull { (it.name ?: it.guid) == name } ?: return
+        connectProfile(p)
+    }
+
+    /**
+     * ⋮ overflow → handler เดิมทั้งหมด (round 23 task 7): เมนูเป็นทางเข้าใหม่ ห้ามมี logic ใหม่ที่นี่
+     * (exportImeLog = ทางเข้าเดียวหลังจาก strip ถูกลบ — ดู ManualRevealGuardTest)
+     */
+    private fun runOverflow(id: OverflowItemId) {
+        when (id) {
+            OverflowItemId.keepCpuAwake -> toggleKeepCpuAwake()
+            OverflowItemId.renderer -> toggleEngine()
+            OverflowItemId.fontMinus -> zoom(-2)
+            OverflowItemId.fontPlus -> zoom(2)
+            OverflowItemId.copyConnectionLog -> copyConnectionLog()
+            OverflowItemId.copyImeLog -> exportImeLog()
+            OverflowItemId.exportSettings -> settingsUi.export()
+            OverflowItemId.importSettings -> settingsUi.import()
+            OverflowItemId.licenses -> connectUi.showLicenses()
+            OverflowItemId.checkUpdates -> checkUpdates(manual = true)
+            OverflowItemId.updateChecksToggle -> toggleUpdateChecks()
+        }
     }
 
     private fun zoom(delta: Int) {
@@ -2064,15 +2366,8 @@ class MainActivity : ComponentActivity() {
         s.profile?.let { saveProfile(it.copy(fontSize = s.fontSize)) }
     }
 
-    private fun stripButton(label: String, action: () -> Unit) = TextView(this).apply {
-        text = label
-        setTextColor(0xFFCCCCCC.toInt())
-        setPadding(dp(12), dp(8), dp(12), dp(8))
-        textSize = 13f
-        gravity = Gravity.CENTER
-        setBackgroundColor(0xFF1F1F1F.toInt())
-        setOnClickListener { action() }
-    }
+    /** task 8: หนึ่ง pinch step ≡ กดปุ่ม A± หนึ่งครั้ง = zoom ±2 (path เดียวกับ overflow — persist ต่อ profile) */
+    private fun onPinchStep(direction: Int) = zoom(direction * 2)
 
     private fun dp(v: Int): Int =
         (v * resources.displayMetrics.density).toInt()
@@ -2096,6 +2391,7 @@ class MainActivity : ComponentActivity() {
         flushSnapshotNow() // T4: graceful kill (back/swipe) = เก็บ snapshot รุ่นล่าสุดก่อนตาย
         settingsWatcher?.stop()
         settingsWatcher = null
+        KeyPopup.dismiss() // fix wave B1: static open-popup survives Activity death — no-op when nothing is open
         clipListener?.let { clipboard().removePrimaryClipChangedListener(it) } // M2.2
         clipListener = null
         for (id in manager.ids().toList()) {
@@ -2149,6 +2445,7 @@ class MainActivity : ComponentActivity() {
                     t.focusedPane()?.let { lru.touch(it); focusFollowIme(it) }
                     applyPaneVisuals(tabId)
                     renderActiveStatus()
+                    refreshTabs() // parked (v): ≡ onPaneTouch — chrome ตาม pane focused (keybinding path)
                 }
             }
             "resizePane" -> tab?.let { t ->
@@ -2229,9 +2526,16 @@ class MainActivity : ComponentActivity() {
         @JavascriptInterface
         fun onResize(cols: Int, rows: Int) {
             val s = session()
+            // round 23 T5 permanent diagnostic (webview twin of onGridResize): JS-fit grid vs current pty
+            Log.i("AtermResize", "webview grid ${cols}x${rows} pty ${s.cols}x${s.rows}")
             s.cols = cols; s.rows = rows
             s.controller.resize(cols, rows)
-            runOnUiThread { if (s === activePane()) renderActiveStatus() }
+            runOnUiThread {
+                // review fix (task 7): TabInfo.cols/rows + header "name (W×H)" เป็น snapshot —
+                // ทุก writer ของ s.cols/s.rows ต้อง refreshTabs ด้วย (resize ไม่ใช่ hot-path)
+                refreshTabs()
+                if (s === activePane()) renderActiveStatus()
+            }
         }
 
         @JavascriptInterface
@@ -2349,15 +2653,94 @@ class EchoBackend : TerminalBackend {
 /**
  * round 15-HW: root container + window-level touch observer — dispatchTouchEvent ของ parent
  * วิ่งก่อนลูกเสมอจึงเห็นทุก event ครบ stream (รวม POINTER_* และ UP ที่ลูก consume ไปแล้ว);
- * observe-only — ส่งต่อ super ทุกตัวอักษร, gesture machine ไม่มีสิทธิ์ consume
+ * onGesture ถูกเรียกกับ *ทุก* event เสมอ เป็นอันดับแรก ไม่มีข้อยกเว้น (ruling d — tap-gate/IME
+ * machine ของ ADR 0001 ห้ามกระทบ: ดู ManualRevealGuardTest)
+ *
+ * round 23 task 8: pinch-to-zoom — ScaleGestureDetector สะสม scaleFactor (ruling a: reset เมื่อ
+ * นิ้ว < 2 หรือ gesture จบ, ปัจจัยแรกของ anchor ใหม่ถูกข้าม = กัน jump ปลอม) ป้อน PinchGate;
+ * เมื่อ gate ทำงาน: ส่ง ACTION_CANCEL สังเคราะห์ให้ลูก 1 ครั้ง (selection/webview ห้ามค้าง
+ * กลาง stream — ruling c) แล้ว swallow ทั้ง stream จนนิ้วสุดท้ายขึ้น (release ตอน pointer count 0)
  */
 private class GestureRoot(
     context: android.content.Context,
     private val onGesture: (android.view.MotionEvent) -> Unit,
 ) : LinearLayout(context) {
+    /** หนึ่ง pinch step = ±1 (pinch out = ตัวใหญ่) ≡ สัมพันธ์ 1:1 กับปุ่ม A± เดิม (zoom ±2) */
+    var onPinch: ((Int) -> Unit)? = null
+
+    private val gate = PinchGate()
+    private val pendingSteps = ArrayList<Int>() // parked (t): steps ที่ยิงระหว่าง detector call — ห้ามใช้ตรง ๆ ก่อนลูกได้ CANCEL
+    private var acc = 1f          // accumulated scale since the two-finger anchor (ruling a)
+    private var rebase = false    // นิ้วหลุด < 2 → ignore scaleFactor แรกของ anchor ใหม่
+    private var swallowing = false // ลูกได้ CANCEL แล้ว — กลืน rest of stream
+    private var justActivated = false
+
+    init {
+        // parked (t): gate เก็บ step ไว้ก่อน (แทนเรียก onPinch ตรง ๆ) — ผู้ dispatch เป็นคน flush
+        // *หลัง* ลูกได้ ACTION_CANCEL แล้ว = zoom เกิดทีหลัง child teardown (order nit เดิม: zoom ก่อน cancel 1 จังหวะ)
+        gate.onStep = { dir -> pendingSteps += dir }
+    }
+
+    /** ใช้ step ที่ค้างอยู่ — เรียกหลัง super.dispatch (CANCEL หรือ normal stream) เสมอ = ไม่มี step ค้างข้าม event */
+    private fun flushSteps() {
+        if (pendingSteps.isEmpty()) return
+        val steps = ArrayList(pendingSteps)
+        pendingSteps.clear()
+        for (dir in steps) onPinch?.invoke(dir)
+    }
+
+    private val scaleDetector = android.view.ScaleGestureDetector(
+        context,
+        object : android.view.ScaleGestureDetector.SimpleOnScaleGestureListener() {
+            override fun onScale(detector: android.view.ScaleGestureDetector): Boolean {
+                if (rebase) { rebase = false; acc = 1f; return false }
+                acc *= detector.scaleFactor
+                // parked (s): ไม่มี zoom callback = gate ห้าม engage — ไม่งั้น gate กลืน stream ของลูก
+                // (CANCEL+swallow) เพื่อ zoom ที่จะไม่มีวันเกิด — host ที่ไม่ได้ต่อ onPinch ต้องได้ gesture เดิมคืน
+                if (onPinch != null && gate.onScale(acc)) justActivated = true
+                return false // observe-only ต่อ detector — สิทธิ์ consume อยู่ที่ dispatchTouchEvent
+            }
+        },
+    )
+
     override fun dispatchTouchEvent(ev: android.view.MotionEvent): Boolean {
-        onGesture(ev)
-        return super.dispatchTouchEvent(ev)
+        onGesture(ev) // ruling d: sacred — ทุก event, ก่อนเสมอ, ไม่มีเงื่อนไข (รวมตัวที่กลืน)
+        val action = ev.actionMasked
+        if (action == android.view.MotionEvent.ACTION_DOWN) { // stream ใหม่ = state ต้องสะอาด
+            acc = 1f; rebase = false; swallowing = false; justActivated = false
+            pendingSteps.clear() // stream เก่าจบแบบไม่มี UP ครบ = step ค้างต้องไม่ข้าม gesture
+            gate.onPointerUp(0) // กัน active ค้างจาก stream ก่อนที่ UP หลุดหาย
+        }
+        scaleDetector.onTouchEvent(ev)
+        val count = when (action) {
+            android.view.MotionEvent.ACTION_UP, android.view.MotionEvent.ACTION_CANCEL -> 0
+            android.view.MotionEvent.ACTION_POINTER_UP -> ev.pointerCount - 1
+            else -> ev.pointerCount
+        }
+        if (count < 2) { acc = 1f; rebase = true } // ruling a
+        if (action == android.view.MotionEvent.ACTION_UP ||
+            action == android.view.MotionEvent.ACTION_POINTER_UP ||
+            action == android.view.MotionEvent.ACTION_CANCEL
+        ) gate.onPointerUp(count)
+        if (justActivated) {
+            justActivated = false
+            swallowing = true
+            // ruling c: ลูกต้องไม่ค้างกลาง gesture — copy event ปัจจุบันเป็น CANCEL ส่งลง super
+            val cancel = android.view.MotionEvent.obtain(ev)
+            cancel.action = android.view.MotionEvent.ACTION_CANCEL
+            super.dispatchTouchEvent(cancel)
+            cancel.recycle()
+            flushSteps() // parked (t): ลูกได้ CANCEL ก่อน แล้วค่อย apply zoom step (ลำดับเดิมกลับกัน = selection/scroll โดนแก้ทีหลัง zoom)
+            return true
+        }
+        if (swallowing) {
+            flushSteps() // band เพิ่มกลาง stream: ลูกถูก cancel ไปแล้ว — flush ทุก event กัน step ค้าง
+            if (count == 0) swallowing = false // release ภายหลัง event สุดท้ายนี้ (ลูกถูก cancel ไปแล้ว)
+            return true
+        }
+        val handled = super.dispatchTouchEvent(ev)
+        flushSteps() // ปกติ gate ไม่ข้าม band = ไม่มี step — flush กันเหนียว (band0 only path)
+        return handled
     }
 }
 

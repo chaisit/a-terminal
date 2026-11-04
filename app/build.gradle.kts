@@ -32,8 +32,11 @@ android {
         // round-15: IME gate, canvas renderer, Unicode 11, MIT + notices ใน APK = เปลี่ยนพฤติกรรมที่ user เห็น → minor bump
         // 0.3.0: public release แรก — UI อังกฤษ, settings เขียนแบบ atomic; 0.2.4 = patch P5 ตัวซ้ำ; 0.2.3 = กู้ pane; 0.2.2 = secrets + ปิด backup
         // 0.4.5: re-pin ยืนยัน fingerprint เมื่อ host key เปลี่ยน (ปิด deadlock "ผู้ใช้ติดตาย" ของ 0.4.4)
-        versionCode = 18
-        versionName = "0.4.8"
+        // round-23 → 0.5.0 (code 19): chrome ทั้งชุด — Keys Bar fit-to-width+fold(⋯)+presets, top bar แถวเดียว (pills/∨/⋮),
+        // pinch-zoom, chrome ตาม scheme, menu=ปิด IME ก่อน, back-as-escape, ปุ่ม paste ⚡ กลับมา,
+        // update check (GitHub Releases: auto 1×/วัน + manual, cumulative changelog — release แรกที่จะถูกเช็คเจอ = release ถัดไป)
+        versionCode = 19
+        versionName = "0.5.0"
     }
 
     signingConfigs {

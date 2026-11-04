@@ -49,5 +49,8 @@
   "copyOnSelect": false,
   "trimPaste": true,
   "autoPasteClipboard": false,
-  "keepCpuAwake": false
+  "keepCpuAwake": false,
+  "backAsEscape": true,
+  "hideKeysBarOnHardwareKeyboard": false,
+  "keysPreset": "default"
 }
