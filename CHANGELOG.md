@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.4.8
+
+- **The on-screen keyboard only appears when you ask for it.** Tapping the terminal — or starting a
+  session, switching tabs, closing a pane — no longer pops it up by itself. The new **⌨ button** at the
+  right end of the keys bar is now the only way it opens, and tapping it again closes the keyboard. If
+  the keyboard is open when you switch panes, it stays open and follows to the new pane. Forms and
+  dialogs keep the system's normal behaviour.
+- **⌨ and ⏎ (Enter) now sit in a pinned zone** at the right edge of the keys bar, outside the horizontal
+  scroll: always visible, always one tap away — in both the full bar and the compact landscape bar. ⏎
+  sends a real terminal Enter and respects a latched CTRL/⇧ exactly like a physical key combination.
+- Long-pressing the **A−** button (the hidden diagnostics gesture) now copies a keyboard event log to
+  the clipboard in every build, including this one — useful when reporting keyboard bugs. The log
+  contains keyboard events only, never terminal content or credentials.
+
 ## 0.4.7
 
 - **CTRL and SHIFT in the keys bar are real modifiers now.** Hold CTRL and type — from the keys bar or

@@ -27,6 +27,11 @@ class ExtraKeysBarTest {
         assertEquals("1B 5B 44", bytes(ExtraKeysBar.LEFT))
     }
 
+    @Test fun enter_is_single_0x0D() {
+        // terminal Enter = CR — ≡ สิ่งที่ xterm/Termux ส่งจริง (ไม่ใช่ \n จาก form semantics)
+        assertEquals("0D", bytes(ExtraKeysBar.ENTER))
+    }
+
     @Test fun ctrl_lock_letters_map_to_control_codes() {
         assertEquals("01", bytes(ExtraKeysBar.ctrlOf('A')))
         assertEquals("03", bytes(ExtraKeysBar.ctrlOf('C'))) // Ctrl+C = SIGINT

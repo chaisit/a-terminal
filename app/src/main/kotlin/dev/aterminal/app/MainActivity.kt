@@ -247,9 +247,11 @@ class MainActivity : ComponentActivity() {
         val strip = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         strip.addView(statusView, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
         val zoomOutBtn = stripButton("A−") { zoom(-2) }
-        // HW-5b (debug-only): user เครื่อง dev เป็น SSH node ไม่มี USB/วง network เดียวกับมือถือ =
-        // adb logcat เข้าไม่ถึง → long-press "A−" = export ATermIme ring → clipboard (paste ส่งได้เลย)
-        if (debugImeLog) zoomOutBtn.setOnLongClickListener { exportImeLog(); true }
+        // HW-5b: user เครื่องจริงเป็น SSH node ไม่มี USB/วง network เดียวกับมือถือ = adb logcat เข้าไม่ถึง →
+        // long-press "A−" = export ATermIme ring → clipboard (paste ส่งได้เลย)
+        // 2026-11-04 user อนุมัติ: เปิดใน release ด้วย (เดิม debug-only — เจอจริง: Honor ที่ลง release แตะแช่แล้วเงียบ;
+        // ring มีแต่ IME transition ไม่มี secret) — *ซ่อน* เหมือนเดิม ห้ามย้ายเข้าเมนู visible
+        zoomOutBtn.setOnLongClickListener { exportImeLog(); true }
         strip.addView(zoomOutBtn)
         strip.addView(stripButton("A+") { zoom(2) })
         strip.addView(stripButton("⚡") { pasteNow(fromClipboard = true) })
@@ -270,12 +272,15 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
-        keysBar = ExtraKeysBar(this, mods) { key -> routeKey(key) }
+        keysBar = ExtraKeysBar(this, mods,
+            onKey = { key -> routeKey(key) },
+            onKeyboardToggle = { toggleKeyboard() }) // Manual Reveal (ADR 0001): ⌨ = ทาง reveal เดียว
         root.addView(keysBar)
         // C12: landscape + IME เปิด → หดเหลือ mini bar (portrait / IME ปิด = layout เดิม 100%)
         miniBar = MiniKeysBar(this,
             onKey = { key -> routeKey(key) },   // seam เดียวกับ bar เต็ม (round 7: markMode divert ใน routeKey)
-            onRestore = { forceFullKeys = true; applyKeysBars() })
+            onRestore = { forceFullKeys = true; applyKeysBars() },
+            onKeyboardToggle = { toggleKeyboard() })
         miniBar.visibility = View.GONE
         root.addView(miniBar)
         keyboardWatcher = KeyboardWatcher(root)
@@ -294,6 +299,8 @@ class MainActivity : ComponentActivity() {
                     releaseImeHold()         // round 15-HW: ดูคำอธิบายเต็มในฟังก์ชัน
                 }
             }
+            keysBar.setImeUp(up) // ⌨ pinned = viewer ของสถานะจริง — ห้ามมี state ค้างในปุ่ม (ADR 0001)
+            miniBar.setImeUp(up)
             applyKeysBars()
         }
         keyboardWatcher.start()
@@ -398,7 +405,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
-        if (hasFocus) activePane()?.let { focusAndReveal(it) }
+        if (hasFocus) activePane()?.let { focusFollowIme(it) }
     }
 
     // configChanges ใน Manifest เก็บ rotation ไว้ที่ activity (session ไม่หาย — C11) จึง hookตรงนี้ได้อิสระ
@@ -447,10 +454,12 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * IME + JS focus — เรียกเมื่อ gesture ตัดสินแล้วว่าเป็น tap (observeGesture) หรือ caller non-touch
+     * IME + JS focus — **caller เดียว = toggleKeyboard (ปุ่ม ⌨ pinned zone, ADR 0001)**;
+     * tap/non-touch ห้ามเรียก (Manual Reveal: คีย์บอร์ดเกิดด้วยปุ่มเท่านั้น)
      * JS term.focus() (textarea รับ keystrokes) ต้องมาก่อน/คู่กับ showSoftInput — native ไม่มีชั้น JS
      */
     private fun revealIme(s: TerminalSession) {
+        unlockEditor(s) // คืน *ก่อน* reveal — IC/valve ต้องพร้อม
         val target = s.webView ?: s.view
         imeServedPane = s // จำไว้ปล่อย focus ตอน IME ปิด (ดู releaseImeHold)
         imeUserRequested = true // ตั้งแต่นี้ไป IME ที่เปิดอยู่ = ของ user, closeImeIfSneaked ห้ามแตะ
@@ -461,10 +470,45 @@ class MainActivity : ComponentActivity() {
         imeLog("revealIme ${s.hashCode()}")
     }
 
-    /** focus+IME ≡ พฤติกรรม focusTerminal เดิม — ใช้ที่ caller non-touch ทั้ง 5 จุด (tab switch/restore/menu) */
-    private fun focusAndReveal(s: TerminalSession) {
+    /**
+     * focus โดยไม่ Reveal (Manual Reveal ADR 0001 — ใช้ที่ caller non-touch ทั้ง 5 จุด แทน auto-reveal เดิม):
+     * คีย์บอร์ดปิด = focus เฉพาะ View; เปิดอยู่ = คีย์บอร์ดตามไป pane นี้ (เปิดวาล์ว + JS focus, ห้าม showSoftInput ใหม่)
+     * วาล์วเปิดได้เพราะ IME เปิดอยู่แล้ว — ไม่ได้สร้าง path เกิดใหม่ให้ IME (sneak guards ทั้งหมด ยังทำงาน)
+     */
+    private fun focusFollowIme(s: TerminalSession) {
         focusTerminal(s)
-        revealIme(s)
+        if (!imeUp) return
+        // HW-5c: ปิดวาล์วทุก pane ก่อนเปิดเฉพาะตัวใหม่ — วาล์วค้างที่ pane เก่า = hole ให้ Chromium show ข้าม gate
+        closeFocusValveAllPanes()
+        unlockEditor(s)
+        s.js("window.__atermAllowFocus=true;window.term && term.focus();") // no-op เมื่อ native (js() guard)
+        imeServedPane = s // transition up→down (releaseImeHold) ต้อง cleanup pane ปัจจุบัน ไม่ใช่ตัวเก่า
+    }
+
+    /** ปลดสถานะ text-editor ของหนึ่ง pane (สอง renderer) — จุดเดียวที่แตะ internals สอง class นี้ (review round 22) */
+    private fun unlockEditor(s: TerminalSession) {
+        if (s.native) (s.view as? TerminalView)?.textEditorEnabled = true
+        else (s.webView as? ImeGateWebView)?.editorEnabled = true
+    }
+
+    /**
+     * Manual Reveal (ADR 0001, round 22): ผู้เรียกเดียว = ปุ่ม ⌨ pinned zone ของสอง bar
+     * สถานะอ่านจาก imeUp (KeyboardWatcher = single source of truth) — ปิดต้องตาม path เดียวกับ
+     * closeImeIfSneaked (ปิดวาล์ว → hide → restartInput) กัน vendor stack จำ viewClicked แล้ว reopen
+     */
+    private fun toggleKeyboard() {
+        if (currentFocus is android.widget.EditText) return // find bar/dialog มี IME flow ของตัวเอง
+        val s = activePane() ?: return
+        if (!imeUp) { revealIme(s); return }
+        imeUserRequested = false // user สั่งปิด — protection สิ้นสุดทันที (transition up→down cleanup ตามปกติ)
+        closeFocusValveAllPanes()
+        val served = imeServedPane ?: s // pane ที่ IME เกาะจริง (split อาจไม่ตรงกับ activePane)
+        val token = (s.webView ?: s.view).windowToken ?: return
+        runCatching { imm?.hideSoftInputFromWindow(token, 0) }
+            .onFailure { imeLog("btn hide fail: ${it.message}") } // convention: ห้าม swallow เงียบ
+        runCatching { imm?.restartInput(served.webView ?: served.view) } // ลบ viewClicked ของ pane ที่เคย serve
+            .onFailure { imeLog("btn restartInput fail: ${it.message}") }
+        imeLog("hide by keyboard button ${served.hashCode()}")
     }
 
     /**
@@ -516,8 +560,7 @@ class MainActivity : ComponentActivity() {
                 val tap = tapGate.up(ev.eventTime) == dev.aterminal.render.input.TapGate.Result.Tap
                 // tap ลง overlay ที่มี EditText ของตัวเอง (find bar/dialog) = IME flow ของมัน ห้ามไปแย่ง
                 if (tap && s != null && currentFocus !is android.widget.EditText) {
-                    if (s.native) (s.view as? TerminalView)?.textEditorEnabled = true // คืน *ก่อน* reveal — input connection ต้องพร้อม
-                    revealIme(s)
+                    focusTerminal(s) // Manual Reveal (ADR 0001, round 22): tap ไม่ Reveal อีก — คีย์บอร์ดออกได้ทางปุ่ม ⌨ เท่านั้น
                 } else if (s != null) {
                     // non-tap: gesture ที่เริ่มจาก IME ปิด ต้องจบแบบปิด (backstop — ดูฟังก์ชัน)
                     // HW-4: ถ้า gesture นี้คือ long-press select (imeHoldHidden) → ห้าม closeImeIfSneaked
@@ -561,12 +604,12 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // HW-5b: ring ของ ATermIme (debug-only, cap ~400) — export ผ่าน long-press "A−"
+    // HW-5b: ring ของ ATermIme (cap ~400) — export ผ่าน long-press "A−" ทุก build (user อนุมัติ 2026-11-04)
     private val imeRing = ArrayDeque<String>()
 
     private fun imeLog(msg: String) {
-        if (!debugImeLog) return
-        android.util.Log.d("ATermIme", msg)
+        // ring บันทึกทุก build (release ต้องมีข้อมูลให้ A− export); logcat เฉพาะ debuggable เท่านั้น
+        if (debugImeLog) android.util.Log.d("ATermIme", msg)
         val line = "${android.os.SystemClock.uptimeMillis()} $msg" // timebase เดียวกับ IME UP/DOWN @ms
         synchronized(imeRing) {
             if (imeRing.size >= 400) imeRing.removeFirst()
@@ -804,7 +847,7 @@ class MainActivity : ComponentActivity() {
                     // flush connect ที่แข่งมาก่อน JS พร้อม (pane ใหม่ — ไม่งั้น bytesแรกของ backend หาย)
                     s.pendingConnect?.let { s.pendingConnect = null; it() }
                     // focus เฉพาะ pane ที่ user กำลังมอง — WebView ที่ load ช้ากว่าห้ามฉก IME
-                    if (s === activePane()) focusAndReveal(s)
+                    if (s === activePane()) focusFollowIme(s)
                     // boot dialog เฉพาะ tab แรก pane เดียวที่ยังว่าง (เหมือน round 4) — split/pane ใหม่ไม่เด้งซ้ำ
                     val tab = tabOf(s)
                     if (s.profile == null && tab != null && tab.panes.size == 1 &&
@@ -857,7 +900,7 @@ class MainActivity : ComponentActivity() {
         s.js("window.term && term.writeln(${JSONObject.quote("\u001b[2m[$note]\u001b[0m")});")
         s.rendererRecovery.drain().forEach { s.js(it) }
         s.pendingConnect?.let { s.pendingConnect = null; it() }
-        if (s === activePane()) focusTerminal(s) // ไม่ใช้ focusAndReveal: renderer ตายเองไม่ควรทำให้คีย์บอร์ดเด้ง
+        if (s === activePane()) focusTerminal(s) // ไม่ Reveal (ADR 0001): renderer ตายเองไม่ควรทำให้คีย์บอร์ดถูกเปิด
         if (connected) {
             // ขนาดเท่าเดิมไม่เกิด SIGWINCH: ขยับ 1 แถวแล้วคืน ให้ tmux/vim วาดจอใหม่ โดยไม่ส่งอะไรเข้า shell
             s.view.postDelayed({
@@ -1250,7 +1293,7 @@ class MainActivity : ComponentActivity() {
         } else {
             applyLayout(tabId); applyPaneVisuals(tabId)
             if (tabId == manager.activeId) {
-                activePane()?.let { focusAndReveal(it) }
+                activePane()?.let { focusFollowIme(it) }
                 renderActiveStatus()
             }
             refreshTabs()
@@ -1386,7 +1429,7 @@ class MainActivity : ComponentActivity() {
             applyLayout(id)
             applyPaneVisuals(id)
         }
-        activePane()?.let { focusAndReveal(it) }
+        activePane()?.let { focusFollowIme(it) }
         renderActiveStatus()
         refreshTabs()
     }
@@ -2103,7 +2146,7 @@ class MainActivity : ComponentActivity() {
             "moveFocus" -> tab?.let { t ->
                 // mobile 2-pane cap: left/right/up/down/previous = สลับอีก pane เท่ากัน (trace: WT FocusDirection subset)
                 if (t.panes.size == 2 && t.setFocused(1 - t.focused)) {
-                    t.focusedPane()?.let { lru.touch(it); focusAndReveal(it) }
+                    t.focusedPane()?.let { lru.touch(it); focusFollowIme(it) }
                     applyPaneVisuals(tabId)
                     renderActiveStatus()
                 }
