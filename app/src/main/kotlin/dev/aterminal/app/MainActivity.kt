@@ -1720,19 +1720,25 @@ class MainActivity : ComponentActivity() {
     /**
      * Update Notice: mark dismissed **เมื่อดialogขึ้นจริงเท่านั้น** (F6: showGuarded ทิ้ง dialog
      * ตอน activity ตาย = ยังไม่เคยเห็น release นี้ ห้ามเงียบตลอดไป — ครั้งถัดไปได้);
-     * View release = เปิดหน้า release ใน browser (ทางติดตั้งเดียว, Q4-ก) — ไม่มี in-app installer
+     * Download = เปิด browser_download_url ของ asset .apk ตรง ๆ (ถึงไฟล์ apk ในหนึ่งแตะ — HW 11-04)
+     * View release = หน้า release; ทางติดตั้งยังเป็น browser ตามเดิมทุกประการ ไม่มี in-app installer (Q4-ก) —
+     * feed ไม่มี apk = fallback ปุ่มเดียว View release
      */
     private fun showUpdateNotice(newer: List<UpdateCheck.Release>) {
         pendingUpdate = null
         val top = newer.first()
         closeImeForMenus() // policy task 10: dialog ทุกตัวจาก path นี้ปิด IME ก่อนเหมือนกัน
         val body = UpdateCheck.cumulativeChangelog(newer)
-        val shown = android.app.AlertDialog.Builder(this)
+        val builder = android.app.AlertDialog.Builder(this)
             .setTitle("Update available — ${top.tag}")
             .setMessage(if (body.isBlank()) "No release notes." else body)
-            .setPositiveButton("View release") { _, _ -> openReleaseUrl(top.url) }
-            .setNegativeButton("Later", null)
-            .showGuarded(this)
+        if (top.apkUrl.isNotEmpty()) {
+            builder.setPositiveButton("Download ${top.tag}") { _, _ -> openReleaseUrl(top.apkUrl) }
+                .setNeutralButton("View release") { _, _ -> openReleaseUrl(top.url) }
+        } else {
+            builder.setPositiveButton("View release") { _, _ -> openReleaseUrl(top.url) }
+        }
+        val shown = builder.setNegativeButton("Later", null).showGuarded(this)
         if (shown != null) { // F6: mark = เคยเห็นแล้ว (ครั้งเดียวต่อ release ไม่ว่าตอบปุ่มไหน)
             settings = settings.copy(dismissedUpdateTag = top.tag)
             persistSettings()

@@ -23,12 +23,20 @@ class UpdateCheckTest {
         url: String = "https://github.com/chaisit/a-terminal/releases/tag/$tag",
         draft: Boolean = false,
         prerelease: Boolean = false,
+        assets: List<Pair<String, String>> = emptyList(), // (asset name, browser_download_url)
     ) = org.json.JSONObject().apply {
         put("tag_name", tag)
         if (body != null) put("body", body)
         put("html_url", url)
         put("draft", draft)
         put("prerelease", prerelease)
+        if (assets.isNotEmpty()) {
+            put("assets", JSONArray().apply {
+                assets.forEach { (name, link) ->
+                    put(org.json.JSONObject().put("name", name).put("browser_download_url", link))
+                }
+            })
+        }
     }
 
     // --- parseReleases ---
@@ -50,6 +58,24 @@ class UpdateCheckTest {
 
     @Test fun emptyArrayParsesToEmptyList() {
         assertEquals(emptyList<UpdateCheck.Release>(), UpdateCheck.parseReleases("[]"))
+    }
+
+    @Test fun apkAssetUrlParsedNonApkAssetsIgnored() {
+        val text = releasesJson(
+            release(
+                "v0.6.0",
+                assets = listOf(
+                    "SHA256SUMS.txt" to "https://github.com/download/sums",
+                    "app-release.apk" to "https://github.com/download/apk",
+                ),
+            )
+        )
+        assertEquals("https://github.com/download/apk", UpdateCheck.parseReleases(text).single().apkUrl)
+    }
+
+    @Test fun noApkAssetMeansEmptyApkUrl() { // dialog fallback = View release (ห้ามชี้ sum file เป็น download)
+        assertEquals("", UpdateCheck.parseReleases(releasesJson(release("v0.6.0", assets = listOf("sums.txt" to "https://x/sums")))).single().apkUrl)
+        assertEquals("", UpdateCheck.parseReleases(releasesJson(release("v0.6.0"))).single().apkUrl)
     }
 
     // --- parseVersion ---

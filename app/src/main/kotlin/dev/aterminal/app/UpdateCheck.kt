@@ -30,6 +30,8 @@ object UpdateCheck {
         val url: String,
         val draft: Boolean,
         val prerelease: Boolean,
+        // browser_download_url ของ asset .apk (HW 11-04: user ต้องการกดแล้วโหลดทันที) — "" = ไม่มี apk → Notice fallback ไป url
+        val apkUrl: String = "",
     )
 
     /** GET list endpoint (list ไม่ใช่ /latest — Cumulative Changelog ต้องการ body ทุกตัวระหว่างทาง, Q5) */
@@ -58,8 +60,20 @@ object UpdateCheck {
                 url = o.optString("html_url", ""),
                 draft = o.optBoolean("draft", false),
                 prerelease = o.optBoolean("prerelease", false),
+                apkUrl = apkDownloadUrl(o),
             )
         }
+    }
+
+    /** browser_download_url จาก asset `.apk` ตัวเดียว (asset sum/notes ห้ามกลายเป็นปุ่ม download) — ไม่มี = "" */
+    private fun apkDownloadUrl(o: org.json.JSONObject): String {
+        val assets = o.optJSONArray("assets") ?: return ""
+        for (i in 0 until assets.length()) {
+            val a = assets.optJSONObject(i) ?: continue
+            val url = a.optString("browser_download_url", "")
+            if (url.isNotEmpty() && a.optString("name", "").endsWith(".apk", ignoreCase = true)) return url
+        }
+        return ""
     }
 
     /**

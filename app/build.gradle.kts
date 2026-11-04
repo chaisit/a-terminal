@@ -36,8 +36,9 @@ android {
         // pinch-zoom (→ ตัดออก 11-04 หลังทดสอบเครื่องจริง), chrome ตาม scheme, menu=ปิด IME ก่อน, back-as-escape, ปุ่ม paste ⚡ กลับมา,
         // update check (GitHub Releases: auto 1×/วัน + manual, cumulative changelog — release แรกที่จะถูกเช็คเจอ = release ถัดไป)
         // 0.5.1 (code 20): ผลทดสอบเครื่องจริงบน 0.5.0 — ตัด pinch-to-zoom ออก (ขนาดตัวยังอยู่ที่ ⋮ ตามเดิม)
-        versionCode = 20
-        versionName = "0.5.1"
+        // 0.5.2 (code 21): Update Notice เพิ่มปุ่ม Download <tag> เปิดไฟล์ apk ตรงจาก browser_download_url
+        versionCode = 21
+        versionName = "0.5.2"
     }
 
     signingConfigs {

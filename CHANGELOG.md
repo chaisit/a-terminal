@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.2
+
+- **Update notices now download the APK with one tap.** The "Update available" dialog has a new
+  primary button, **Download v.X.Y.Z**, which opens the APK file directly in your browser — no more
+  hunting for the asset on the release page. **View release** is still there as a secondary button
+  (and remains the only button for releases without a downloadable APK). Installing still happens
+  through your browser as before; the app never installs anything itself.
+
 ## 0.5.1
 
 - **Pinch-to-zoom has been removed.** The two-finger font-size gesture added in 0.5.0 could not be
