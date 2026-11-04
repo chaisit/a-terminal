@@ -245,8 +245,6 @@ class MainActivity : ComponentActivity() {
         root = GestureRoot(this) { ev -> observeGesture(ev) }.apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(0xFF0C0C0C.toInt()) // boot fallback ก่อน refreshTabsครั้งแรก (applyChrome ทา scheme ทับ)
-            // task 8: pinch แทนปุ่ม A± (round 23) — path เดียวกับ zoom() จึง persist ต่อ profile เหมือนเดิม
-            onPinch = { dir -> onPinchStep(dir) }
         }
 
         // ComposeView ต้องการ owners บน view tree (เราไม่ใช้ activity-compose setContent ทั้งจอ)
@@ -2366,8 +2364,10 @@ class MainActivity : ComponentActivity() {
         s.profile?.let { saveProfile(it.copy(fontSize = s.fontSize)) }
     }
 
-    /** task 8: หนึ่ง pinch step ≡ กดปุ่ม A± หนึ่งครั้ง = zoom ±2 (path เดียวกับ overflow — persist ต่อ profile) */
-    private fun onPinchStep(direction: Int) = zoom(direction * 2)
+    // pinch-to-zoom (round 23 task 8) ตัดออก 11-04 ตาม user decision หลัง HW gate:
+    // re-render ต่อ step ตามไม่ทันบนเครื่องจริงทั้งสอง renderer (native หนักสุด) — สอง wave
+    // (batch persist, coalesce 150ms) ยังไม่ผ่านเกณฑ์; font size = ปุ่ม A± ในเมนู ⋮ เท่านั้น
+    // git history: "feat(round 23): pinch" + PinchGate (pure core + JVM tests) ถ้า want กลับ
 
     private fun dp(v: Int): Int =
         (v * resources.displayMetrics.density).toInt()
@@ -2656,91 +2656,16 @@ class EchoBackend : TerminalBackend {
  * onGesture ถูกเรียกกับ *ทุก* event เสมอ เป็นอันดับแรก ไม่มีข้อยกเว้น (ruling d — tap-gate/IME
  * machine ของ ADR 0001 ห้ามกระทบ: ดู ManualRevealGuardTest)
  *
- * round 23 task 8: pinch-to-zoom — ScaleGestureDetector สะสม scaleFactor (ruling a: reset เมื่อ
- * นิ้ว < 2 หรือ gesture จบ, ปัจจัยแรกของ anchor ใหม่ถูกข้าม = กัน jump ปลอม) ป้อน PinchGate;
- * เมื่อ gate ทำงาน: ส่ง ACTION_CANCEL สังเคราะห์ให้ลูก 1 ครั้ง (selection/webview ห้ามค้าง
- * กลาง stream — ruling c) แล้ว swallow ทั้ง stream จนนิ้วสุดท้ายขึ้น (release ตอน pointer count 0)
+ * (round 23 task 8 pinch-to-zoom เคยอยู่ที่นี้ — ตัดออก 11-04 ตาม user decision: re-render per
+ * step ไม่ทันบนเครื่องจริงทั้งสอง renderer; font size กลับไปทางปุ่ม A± ในเมนู ⋮ เท่านั้น)
  */
 private class GestureRoot(
     context: android.content.Context,
     private val onGesture: (android.view.MotionEvent) -> Unit,
 ) : LinearLayout(context) {
-    /** หนึ่ง pinch step = ±1 (pinch out = ตัวใหญ่) ≡ สัมพันธ์ 1:1 กับปุ่ม A± เดิม (zoom ±2) */
-    var onPinch: ((Int) -> Unit)? = null
-
-    private val gate = PinchGate()
-    private val pendingSteps = ArrayList<Int>() // parked (t): steps ที่ยิงระหว่าง detector call — ห้ามใช้ตรง ๆ ก่อนลูกได้ CANCEL
-    private var acc = 1f          // accumulated scale since the two-finger anchor (ruling a)
-    private var rebase = false    // นิ้วหลุด < 2 → ignore scaleFactor แรกของ anchor ใหม่
-    private var swallowing = false // ลูกได้ CANCEL แล้ว — กลืน rest of stream
-    private var justActivated = false
-
-    init {
-        // parked (t): gate เก็บ step ไว้ก่อน (แทนเรียก onPinch ตรง ๆ) — ผู้ dispatch เป็นคน flush
-        // *หลัง* ลูกได้ ACTION_CANCEL แล้ว = zoom เกิดทีหลัง child teardown (order nit เดิม: zoom ก่อน cancel 1 จังหวะ)
-        gate.onStep = { dir -> pendingSteps += dir }
-    }
-
-    /** ใช้ step ที่ค้างอยู่ — เรียกหลัง super.dispatch (CANCEL หรือ normal stream) เสมอ = ไม่มี step ค้างข้าม event */
-    private fun flushSteps() {
-        if (pendingSteps.isEmpty()) return
-        val steps = ArrayList(pendingSteps)
-        pendingSteps.clear()
-        for (dir in steps) onPinch?.invoke(dir)
-    }
-
-    private val scaleDetector = android.view.ScaleGestureDetector(
-        context,
-        object : android.view.ScaleGestureDetector.SimpleOnScaleGestureListener() {
-            override fun onScale(detector: android.view.ScaleGestureDetector): Boolean {
-                if (rebase) { rebase = false; acc = 1f; return false }
-                acc *= detector.scaleFactor
-                // parked (s): ไม่มี zoom callback = gate ห้าม engage — ไม่งั้น gate กลืน stream ของลูก
-                // (CANCEL+swallow) เพื่อ zoom ที่จะไม่มีวันเกิด — host ที่ไม่ได้ต่อ onPinch ต้องได้ gesture เดิมคืน
-                if (onPinch != null && gate.onScale(acc)) justActivated = true
-                return false // observe-only ต่อ detector — สิทธิ์ consume อยู่ที่ dispatchTouchEvent
-            }
-        },
-    )
-
     override fun dispatchTouchEvent(ev: android.view.MotionEvent): Boolean {
-        onGesture(ev) // ruling d: sacred — ทุก event, ก่อนเสมอ, ไม่มีเงื่อนไข (รวมตัวที่กลืน)
-        val action = ev.actionMasked
-        if (action == android.view.MotionEvent.ACTION_DOWN) { // stream ใหม่ = state ต้องสะอาด
-            acc = 1f; rebase = false; swallowing = false; justActivated = false
-            pendingSteps.clear() // stream เก่าจบแบบไม่มี UP ครบ = step ค้างต้องไม่ข้าม gesture
-            gate.onPointerUp(0) // กัน active ค้างจาก stream ก่อนที่ UP หลุดหาย
-        }
-        scaleDetector.onTouchEvent(ev)
-        val count = when (action) {
-            android.view.MotionEvent.ACTION_UP, android.view.MotionEvent.ACTION_CANCEL -> 0
-            android.view.MotionEvent.ACTION_POINTER_UP -> ev.pointerCount - 1
-            else -> ev.pointerCount
-        }
-        if (count < 2) { acc = 1f; rebase = true } // ruling a
-        if (action == android.view.MotionEvent.ACTION_UP ||
-            action == android.view.MotionEvent.ACTION_POINTER_UP ||
-            action == android.view.MotionEvent.ACTION_CANCEL
-        ) gate.onPointerUp(count)
-        if (justActivated) {
-            justActivated = false
-            swallowing = true
-            // ruling c: ลูกต้องไม่ค้างกลาง gesture — copy event ปัจจุบันเป็น CANCEL ส่งลง super
-            val cancel = android.view.MotionEvent.obtain(ev)
-            cancel.action = android.view.MotionEvent.ACTION_CANCEL
-            super.dispatchTouchEvent(cancel)
-            cancel.recycle()
-            flushSteps() // parked (t): ลูกได้ CANCEL ก่อน แล้วค่อย apply zoom step (ลำดับเดิมกลับกัน = selection/scroll โดนแก้ทีหลัง zoom)
-            return true
-        }
-        if (swallowing) {
-            flushSteps() // band เพิ่มกลาง stream: ลูกถูก cancel ไปแล้ว — flush ทุก event กัน step ค้าง
-            if (count == 0) swallowing = false // release ภายหลัง event สุดท้ายนี้ (ลูกถูก cancel ไปแล้ว)
-            return true
-        }
-        val handled = super.dispatchTouchEvent(ev)
-        flushSteps() // ปกติ gate ไม่ข้าม band = ไม่มี step — flush กันเหนียว (band0 only path)
-        return handled
+        onGesture(ev) // ruling d: sacred — ทุก event, ก่อนเสมอ, ไม่มีเงื่อนไข
+        return super.dispatchTouchEvent(ev)
     }
 }
 

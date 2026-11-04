@@ -33,10 +33,11 @@ android {
         // 0.3.0: public release แรก — UI อังกฤษ, settings เขียนแบบ atomic; 0.2.4 = patch P5 ตัวซ้ำ; 0.2.3 = กู้ pane; 0.2.2 = secrets + ปิด backup
         // 0.4.5: re-pin ยืนยัน fingerprint เมื่อ host key เปลี่ยน (ปิด deadlock "ผู้ใช้ติดตาย" ของ 0.4.4)
         // round-23 → 0.5.0 (code 19): chrome ทั้งชุด — Keys Bar fit-to-width+fold(⋯)+presets, top bar แถวเดียว (pills/∨/⋮),
-        // pinch-zoom, chrome ตาม scheme, menu=ปิด IME ก่อน, back-as-escape, ปุ่ม paste ⚡ กลับมา,
+        // pinch-zoom (→ ตัดออก 11-04 หลังทดสอบเครื่องจริง), chrome ตาม scheme, menu=ปิด IME ก่อน, back-as-escape, ปุ่ม paste ⚡ กลับมา,
         // update check (GitHub Releases: auto 1×/วัน + manual, cumulative changelog — release แรกที่จะถูกเช็คเจอ = release ถัดไป)
-        versionCode = 19
-        versionName = "0.5.0"
+        // 0.5.1 (code 20): ผลทดสอบเครื่องจริงบน 0.5.0 — ตัด pinch-to-zoom ออก (ขนาดตัวยังอยู่ที่ ⋮ ตามเดิม)
+        versionCode = 20
+        versionName = "0.5.1"
     }
 
     signingConfigs {

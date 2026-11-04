@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.1
+
+- **Pinch-to-zoom has been removed.** The two-finger font-size gesture added in 0.5.0 could not be
+  made smooth on real devices — the terminal has to re-layout every text line on each step of the
+  gesture, and even after two rounds of optimization it stayed visibly behind your fingers in both
+  renderers. Rather than ship something that feels laggy, it is cut for now. Font size still lives
+  in **⋮** (**A−** / **A+**), and regular two-finger scrolling and text selection are untouched.
+
 ## 0.5.0
 
 - **The top bar is one row now.** The status strip moved into the tab row: session pills, the status
