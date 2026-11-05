@@ -8,7 +8,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * Update Check core (round 23 amendment):
+ * Update Check core (round 23 amendment) — GLOSSARY §Distribution:
  * Release Feed = GitHub Releases สาธารณะ, Update Notice ครั้งเดียวต่อ release,
  * Cumulative Changelog ใหม่→เก่า; local ≥ published = เงียบ (build ทดสอบไม่ถูกเตือนย้อนหลัง)
  */

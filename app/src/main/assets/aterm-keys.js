@@ -64,7 +64,9 @@
         else (a.direction === 'next' ? AtermFind.next() : AtermFind.prev());
         return true;
       case 'markMode': toggleMark(); return true;
-      case 'sendInput': if (a.input) term.input(String(a.input).replace(/\\u001b/gi, '\x1b')); return true;
+      // HW 11-05: preset bytes = สัญญาว่ามาจากแอป ไม่ใช่ IME → ป้าย 'bar' ก่อน term.input
+      // (ป้าย sticky = ครอบคลุม finalize ที่ xterm deferred ได้; หมดอายุเองถ้าไม่ถูกใช้)
+      case 'sendInput': if (a.input) { if (window.AtermSrc) AtermSrc.set('bar'); term.input(String(a.input).replace(/\\u001b/gi, '\x1b')); } return true;
       case 'clearBuffer': clearBuffer(a.clear || 'all'); return true;
       default: return false;
     }
@@ -135,8 +137,9 @@
   }
   const KEY_BYTES = { up: '\x1b[A', down: '\x1b[B', right: '\x1b[C', left: '\x1b[D', enter: '\r', esc: '\x1b' };
   function markKey(data) { // ทางที่ 2: ExtraKeysBar bytes (bypass JS) — Kotlin divert มาเมื่อ mode on (D6)
-    if (!mark) { if (window.Droid) Droid.onInput(data); return; }
-    if (!consumeMarkData(data)) { exitMark(true); if (window.Droid) Droid.onInput(data); } // unmatched = exit + ส่งจริง
+    // ทั้งสอง branch = คีย์จาก Keys Bar จึงป้าย 'bar' (HW 11-05: onInput ต้องแยก IME ออกจากแอป)
+    if (!mark) { if (window.Droid) Droid.onInput(data, 'bar'); return; }
+    if (!consumeMarkData(data)) { exitMark(true); if (window.Droid) Droid.onInput(data, 'bar'); } // unmatched = exit + ส่งจริง
   }
   /** คืน true = consume แล้ว (อย่าส่งเข้า PTY) */
   function consumeMarkData(data) {

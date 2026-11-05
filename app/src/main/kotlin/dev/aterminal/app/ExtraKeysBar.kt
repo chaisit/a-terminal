@@ -125,6 +125,10 @@ class ExtraKeysBar(
      * preset reload (setLayout → buildRow) ทา chrome ล่าสุดซ้ำเอง, null = ไม่เคยทา → default คงเดิม
      */
     fun setChrome(c: ChromeColors) {
+        // refreshTabs เรียกทุกครั้งที่ grid เปลี่ยน (IME inset/rotate = resize บ่อย) — ค่าเดิม = ห้าม
+        // เพนต์ปุ่มใหม่ทั้งแถบ (สร้าง Drawable + invalidate ทุกปุ่ม)؛ preset reload เรียก
+        // applyChromeToButtons ตรง (ปุ่มใหม่ต้องได้สี) จึงไม่กระทบ path นั้น
+        if (chrome == c) return
         chrome = c
         setBackgroundColor(c.barBg.toArgb())
         applyChromeToButtons()

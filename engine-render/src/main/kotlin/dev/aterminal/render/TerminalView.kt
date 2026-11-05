@@ -14,6 +14,7 @@ import android.text.TextDirectionHeuristics
 import android.text.TextPaint
 import android.text.TextShaper
 import android.util.AttributeSet
+import android.util.LruCache
 import android.view.GestureDetector
 import android.view.InputDevice
 import android.view.KeyEvent
@@ -22,8 +23,10 @@ import android.view.View
 import android.view.inputmethod.BaseInputConnection
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputConnection
+import android.view.inputmethod.InputMethodManager
 import dev.aterminal.core.ActionTarget
 import dev.aterminal.core.Command
+import dev.aterminal.core.ImeAutocomplete
 import dev.aterminal.core.NativeKeymap
 import dev.aterminal.core.ResolvedEntry
 import dev.aterminal.core.ResolvedTable
@@ -53,6 +56,9 @@ import kotlin.math.roundToInt
  *    ว่า android-34 ไม่มี overload PositionedGlyphs บน Canvas; consumer ได้ PositionedGlyphs มา group ตาม Font แล้ว flush)
  *    นี่คือบทเรียน "TextShaper = text not graphics": ให้ shaper จัดThai cluster/combining ให้ตรง posisi
  *  - fallback API 29-30 (T5): drawText ทีละ grapheme cluster ณ cell origin (Clusters) — marks อยู่ในพื้นที่ของ cell ตัวเอง
+ *  - cell lock (round 23 + HW 11-05): run ที่มี combining mark **หรือ** advance รวมไม่ ≡ grid
+ *    = path drawText ต่อ cluster **ทุก API level** (shaper ต่อ cluster = ~1 native call ต่อ cell
+ *    ต่อเฟรม — ดู comment ใน drawRun; เกณฑ์ความกว้าง = CellLock.placementExact + memo ใน view)
  *  - run ASCII (all code<127, w1) = drawText path เดียวกันทุก API (mono advance = cellW)
  *  - input: soft keyboard ผ่าน BaseInputConnection (commit → UTF-8 → onFeed), hardware key ผ่าน onKeyDown
  *    (arrow/DECCKM อ่าน engine.modes.appCursorKeys — vim ต้องได้ \x1bOA)
@@ -93,6 +99,25 @@ class TerminalView @JvmOverloads constructor(context: Context, attrs: AttributeS
 
     // ---- preedit (T5, ≡ xterm.js composition hold — G8) ----
     var preeditEnabled = true // non-WT extension (settings.preeditEnabled); false = path เดิม byte-for-byte (emergency rollback)
+    /**
+     * host ตั้งตาม settings.imeSuggestions (ค่าจริงคำนวณนอก view: `ImeSuggestions.strictNow`)
+     * true = ขอ inputType แบบ "ช่องรหัสผ่านผ่านตา" ซึ่ง IME ส่วนใหญ่เลิกเดาคำให้ **แต่เลิก
+     * compose ด้วย** (วัดจริงแล้ว: tap 'a' ได้ 61 ทันที ไม่มี preedit) = user ต้องเลือกเอง
+     * ระหว่าง " strip เติมคำให้ " กับ "พิมพ์ภาษาที่ต้องรวม cluster ได้" (ดู ImeSuggestions)
+     */
+    var imeStrict = false
+        set(v) {
+            if (field == v) return
+            field = v
+            refreshIme() // IME อ่าน EditorInfo ใหม่ = ผลทันทีโดยไม่ต้องปิด-เปิดคีย์บอร์ด
+        }
+    /**
+     * host นับ "IME ไม่เชื่อ flag" (HW 11-05) — view فقطรายงานสิ่งที่เห็น การตีความ/เตือน
+     * อยู่ที่ host เพราะ webview ส่งสัญญาณเดียวกันคนละ path (Chromium เป็นเจ้าของ InputConnection)
+     * COMPOSITION = IME เปิด composing region ตอนเราขอ password mode; BURST = ข้อความทั้งก้อน
+     * ถึง PTY โดยไม่มี composition (autocorrect/แตะคำจาก strip)
+     */
+    var onImeAutocomplete: ((ImeAutocomplete.Kind, String) -> Unit)? = null
     val preEdit = PreEdit()
 
     // ---- find (T6, ≡ aterm-find.js — state อยู่ที่ view เหมือน JS อยู่ที่ bar; HUD = onFindStatus ≡ Droid.findStatus) ----
@@ -110,7 +135,12 @@ class TerminalView @JvmOverloads constructor(context: Context, attrs: AttributeS
     private val blinkHandler = Handler(Looper.getMainLooper())
     private val blinkTick = object : Runnable {
         override fun run() {
-            if (engine?.modes?.cursorVisible == true) { blinkOn = !blinkOn; invalidate() }
+            if (engine?.modes?.cursorVisible == true) {
+                blinkOn = !blinkOn
+                // redraw ทั้ง grid = ค่ายังชีพของ native renderer — view ไม่ได้ focus = cursor ไม่ถูกวาด
+                // (guard ใน onDraw) จึงไม่ต้องปลุก onDraw ทุก 530ms ตอน find bar/dialog/IME ถือ focus อยู่
+                if (hasFocus()) invalidate()
+            }
             blinkHandler.postDelayed(this, 530)
         }
     }
@@ -126,6 +156,7 @@ class TerminalView @JvmOverloads constructor(context: Context, attrs: AttributeS
         this.fontSizePx = fontSizePx
         this.typefaceStack = FontStack.families(fontFace)
         boldCache.clear() // stack ใหม่ = cache เดิมใช้ไม่ได้ (key hash ของ family เก่า)
+        fitCache.evictAll() // cellW/font เปลี่ยน = ข้อสรุปความกว้างเก่าใช้ไม่ได้ (LruCache ไม่มี clear)
         basePaint.typeface = resolveTypeface(Typeface.NORMAL)
         basePaint.textSize = fontSizePx
         val fm = basePaint.fontMetrics
@@ -283,6 +314,26 @@ class TerminalView @JvmOverloads constructor(context: Context, attrs: AttributeS
     private val paintCursor = Paint()
     private val paintScroll = Paint()
 
+    /** memo ของ "run นี้วางด้วย advance ของมันเองแล้วตรง grid หรือยัง" (ดู [CellLock.placementExact]) */
+    private class RunFit(val text: String, val cells: Int, val face: Typeface, val exact: Boolean)
+
+    /** LruCache ไม่ใช่ HashMap: ข้อความ terminal เปลี่ยนไม่หยุด = cache ไม่จำกัดจะโตไปเรื่อย ๆ */
+    private val fitCache = LruCache<Int, RunFit>(512)
+
+    /**
+     * measureText **ครั้งเดียวต่อ run string ที่เปลี่ยน** (memo แล้ว) แล้วเทียบกับ grid ของมัน
+     * — เร็วกว่า draw ต่อ cluster มาก และ path ที่ถูกเลือกจะถูกต้องทุกเครื่อง
+     * เพราะ measureText ใช้ layout engine เดียวกับที่ shaper ใช้วาง glyph จริง
+     */
+    private fun placementExact(text: String, cells: Int, p: TextPaint): Boolean {
+        val face = p.typeface
+        val key = (text.hashCode() * 31 + cells) * 31 + face.hashCode()
+        fitCache.get(key)?.let { if (it.text == text && it.cells == cells && it.face == face) return it.exact }
+        val ok = CellLock.placementExact(p.measureText(text), cells, cellW)
+        fitCache.put(key, RunFit(text, cells, face, ok))
+        return ok
+    }
+
     private fun drawRun(canvas: Canvas, run: Run, x: Float, baseline: Float) {
         val p = paintFor(run.style)
         p.color = if (run.style.dimAlpha) dim(run.style.fg) else run.style.fg
@@ -290,32 +341,54 @@ class TerminalView @JvmOverloads constructor(context: Context, attrs: AttributeS
             canvas.drawText(run.text, x, baseline, p)
             return
         }
-        if (Build.VERSION.SDK_INT < 31) {
-            // T5: TextShaper ไม่มี API<31 — วาดทีละ grapheme cluster ณ cell origin ของมันเอง
-            // (invariant RunMerger: 1 cell = 1 cluster ใน run — dummy.skip, wide = run เดี่ยว)
+        // Cell lock (round 23) = run ที่มี zero-width cp (combining mark) ต้องถูก anchor ทีละ cluster
+        // ณ cell ของตัวเอง: glyph ของ mark เหล่านี้มาจาก fallback font (NotoSansThai) ซึ่ง advance
+        // ≠ cellW → advance สะสมทั้ง run = เสา '│' ในตารางไทยงอ (บั๊กที่ round 23 ปิด)
+        // Grid contract: every cluster occupies its own cell (RunMerger invariant: dummy skipped,
+        // wide isolated) → anchor cluster i at run.startCol + i.
+        //
+        // perf 11-04: path นี้เคยเป็น TextShaper **ต่อ cluster** บน API31+ ซึ่งจ่ายต่อ cluster =
+        // JNI callback + GlyphVector + Font wrapper + IntArray/FloatArray + ลูป per-glyph
+        // ≈ 1 calls/cell/เฟรม (ไทยเต็มจอ 80 คอลัมน์ = ~2 พัน shape ต่อ redraw หนึ่งครั้ง)
+        // drawText ต่อ cluster = 1 call เล็ก (minikin + cache ของมันเอง) เทียบ shaper ที่จ่าย
+        // JNI + GlyphVector + Font + IntArray/FloatArray ต่อ cluster → ถูกกว่ามาก = path ที่
+        // API<31 ใช้อยู่แล้วรอบ 11 → รวมเป็น path เดียวทุก API level
+        //
+        // HW 11-05 (Honor เพี้ยน, Tab S10+ ไม่เป็น): zero-width อย่างเดียว **กันไม่หมด** — run ที่มีแต่
+        // ตัวเต็ม cell แต่ font หลักไม่มี glyph ให้ (ไทย `นานๆ` ใน FiraCode) ก็ advance ≠ cellW เช่นกัน
+        // → `│` ปิดท้ายเส้นนั้นขยับซ้าย ~8px (วัดจาก screenshot: border อยู่ที่ x=2078 แทน 2086 ขณะที่
+        //   ทุก column อื่นของ row เดียวกันตรงเป๊ะ) ส่วน `─`/`│` ไม่เพี้ยนเพราะ bundled font มี glyph
+        // → จึงวัดความกว้างจริงของ run เทียบ grid (memo แล้ว) แทนการเดา coverage: measureText ใช้ layout
+        //   engine เดียวกับ shaper = เมื่อไหร่ตรง grid, วาดครั้งเดียวได้เสมอ → box-heavy (htop/vim)
+        //   ยังเร็วเท่าเดิม, Thai/ฟอนต์ fallback = anchor ทีละ cell (จ่ายเท่า round 23 ที่ใช้อยู่แล้ว)
+        if (Build.VERSION.SDK_INT < 31 || CellLock.needsPerCluster(run.text) ||
+            !placementExact(run.text, run.endCol - run.startCol, p)
+        ) {
             var cx = x
-            for (c in Clusters.split(run.text)) {
-                canvas.drawText(c, cx, baseline, p)
+            // HW crash 11-04 (Honor PNM-N49, API 37) = **ห้ามใช้ partial-range overload ที่นี่**:
+            // drawText(String, start, X, x, y, paint) กำกวม — docs เขียน X = count แต่ AOSP
+            // BaseRecordingCanvas ตรวจ `(start | end | end - start | text.length() - end) < 0`
+            // = X เป็น exclusive **end** และ throw IndexOutOfBoundsException() แบบไม่มี message
+            // (ตรงกับ log พอดี) — สองความหมายต่างกันเฉพาะ start > 0 ซึ่งเป็น case ของเราทุก cluster
+            // หลังตัวแรก จึงวาด substring ผ่าน drawText(text, x, y, paint) = form เดียวที่
+            // ไม่มีความหมายที่สองให้ตีผิด (path ที่ API<31 ใช้อยู่แล้วตั้งแต่ round 11)
+            // ค่า real: alloc String เล็กต่อ cluster — ถูกกว่า TextShaper ต่อ cluster (ของเดิมรอบ 23) มาก
+            Clusters.forEach(run.text) { s, e ->
+                canvas.drawText(run.text.substring(s, e), cx, baseline, p)
                 cx += cellW
             }
             return
         }
-        // API31+: shaper path — cell lock decides run-relative vs per-cluster anchoring (round 23)
-        if (CellLock.needsPerCluster(run.text)) {
-            // Grid contract: every cluster occupies its own cell (RunMerger invariant: dummy skipped,
-            // wide isolated) → anchor cluster i at run.startCol + i, same as the API<31 Paint fallback.
-            // Run-relative advances here are what made Thai tables show crooked '│' columns.
-            var cx = x
-            for (c in Clusters.split(run.text)) {
-                shapeAndDraw(canvas, c, cx, baseline, p)
-                cx += cellW
-            }
-            return
-        }
+        // API31+ run ที่ layout ของมัน ≡ grid แล้ว (box-drawing/CJK/…) = วาดครั้งเดียว
+        // ทั้ง run โดย advance ของ shaper เอง — พิสูจน์แล้วว่าไม่ drift จึง anchor เพิ่มไม่ต้อง
         shapeAndDraw(canvas, run.text, x, baseline, p)
     }
 
-    /** Shape one text at origin x (shaper advances are relative to x only — the cell lock keeps runs lock-free) */
+    /**
+     * Shape one text at origin x (shaper advances are relative to x only — drawRun admits a run
+     * here only after [placementExact] proved its advance sum equals its grid span, so nothing
+     * downstream of x can drift)
+     */
     private fun shapeAndDraw(canvas: Canvas, text: String, x: Float, baseline: Float, p: TextPaint) {
         TextShaper.shapeText(text, 0, text.length, TextDirectionHeuristics.LTR, p) { _, _, glyphs, gp ->
             val n = glyphs.glyphCount() // javap: method ไม่ใช่ property
@@ -731,23 +804,47 @@ class TerminalView @JvmOverloads constructor(context: Context, attrs: AttributeS
 
     override fun performClick(): Boolean { super.performClick(); return true }
 
+    /** IME อ่าน EditorInfo ใหม่อีกครั้ง (focus ไม่หลุด คีย์บอร์ดไม่กะพริบ) — ดู [imeStrict] */
+    private fun refreshIme() {
+        val imm = context.getSystemService(InputMethodManager::class.java) ?: return
+        runCatching { imm.restartInput(this) }
+    }
+
     override fun onCreateInputConnection(outAttrs: EditorInfo): InputConnection {
         // T5: เดิมใส่ VISIBLE_PASSWORD (กัน autocorrect) = password mode — Gboard *ไม่ compose เลย*
         // (วัดจริง: tap 'a' → commit 61 ทันที, ไม่มี preedit) → ถอดเหลือ TEXT|NO_SUGGESTIONS
         // ≡ xterm webview (textarea autocorrect=off + ยังมีการรวม cluster); บทเรียน จด FINDINGS
-        outAttrs.inputType = EditorInfo.TYPE_CLASS_TEXT or EditorInfo.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+        outAttrs.inputType = if (imeStrict) {
+            EditorInfo.TYPE_CLASS_TEXT or EditorInfo.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD
+        } else {
+            EditorInfo.TYPE_CLASS_TEXT or EditorInfo.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+        }
         outAttrs.imeOptions = EditorInfo.IME_FLAG_NO_EXTRACT_UI or EditorInfo.IME_FLAG_NO_FULLSCREEN
         return object : BaseInputConnection(this, false) {
             override fun commitText(text: CharSequence, newCursorPosition: Int): Boolean {
-                if (!preeditEnabled) { feedText(text.toString()); return true } // path เดิม byte-for-byte
+                if (!preeditEnabled) { // path เดิม byte-for-byte (emergency rollback) = ไม่มี preedit ให้วัด
+                    if (imeStrict) onImeAutocomplete?.invoke(ImeAutocomplete.Kind.BURST, text.toString())
+                    feedText(text.toString()); return true
+                }
                 // T5: t *แทน* composing region — preedit ถูก discard, feed t ครั้งเดียว (≡ G8: onData +1)
                 // t = ทั้งคำ — ตัดส่วนที่ raw-flush/feeding ไปก่อนหน้าแล้วออกก่อน (rawSentText)
+                val composingWasOpen = preEdit.active
                 val rest = stripWrittenPrefix(text.toString())
+                if (imeStrict && !composingWasOpen) {
+                    // rest = ตัวอักษรที่ *เราไม่เคยส่ง* และไม่มี composition กำกับ = IME เติมให้
+                    onImeAutocomplete?.invoke(ImeAutocomplete.Kind.BURST, rest)
+                }
                 rawSentText = ""
                 preEdit.commit(rest)?.let { feedText(it) }
                 invalidate(); return true
             }
             override fun setComposingText(text: CharSequence, newCursorPosition: Int): Boolean {
+                // HW 11-05: password mode ที่ IME เคารพจะไม่มี composing region เลย — มี = ไม่เชื่อ flag
+                // นับครั้งเดียวต่อ region (ไม่ใช่ต่อ update ที่คำยาวขึ้น) = preEdit ยังไม่ active;
+                // path rollback (preeditEnabled=false) ไม่มี preedit ให้อ้าง → วัดด้วย BURST อย่างเดียว
+                if (imeStrict && preeditEnabled && !preEdit.active) {
+                    onImeAutocomplete?.invoke(ImeAutocomplete.Kind.COMPOSITION, text.toString())
+                }
                 // round 21: keys-bar modifier กำลัง active = shortcut, ไม่ใช่ composition — Gboard send
                 // letters ผ่าน setComposingText (วัดจริง ATermMods) ถ้าเก็บเข้า preedit = key แรก "หาย"
                 // (flush ทีหลัง = latch หมดอายุ) → treat-as-final: feed ทันทีผ่าน funnel (+transform)

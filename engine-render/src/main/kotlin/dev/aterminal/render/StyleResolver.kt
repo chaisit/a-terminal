@@ -87,7 +87,7 @@ object StyleResolver {
      * B_PROTECT (512) ไม่ใช่ style — mask ทิ้งก่อนเทียบ (กัน run แตกเพราะ bit ที่มองไม่เห็น)
      */
     fun resolve(cell: Cell, pal: Palette): RenderStyle {
-        val at = cell.attrs and 0x1FF
+        val at = cell.attrs and STYLE_ATTRS
         val bold = at and Cell.B_BOLD != 0
         val inverse = at and Cell.B_INVERSE != 0
         // ≡ xterm.js canvas _getForegroundColor (device-proven 2026-11-03):
@@ -115,4 +115,11 @@ object StyleResolver {
 
     /** ค่า default ของ cell ว่าง (erase/space) — เร็วกว่า resolve ทั้งก้อน */
     fun defaultStyle(pal: Palette) = RenderStyle(pal.defaultFg, pal.defaultBg, false, false, false, false, false, false)
+
+    /**
+     * bit ของ `Cell.attrs` ที่ style มองเห็น (B_PROTECT 512 ไม่ใช่ style — mask ทิ้งก่อนเทียบ)
+     * single source ของ mask นี้: [resolve] ใช้แปล, RunMerger ใช้เทียบว่า style เปลี่ยนหรือไม่
+     * — ถ้าเพิ่ม flag ใหม่ใน RenderStyle ต้องมากขยับ mask ที่นี่ที่เดียว
+     */
+    const val STYLE_ATTRS = 0x1FF
 }

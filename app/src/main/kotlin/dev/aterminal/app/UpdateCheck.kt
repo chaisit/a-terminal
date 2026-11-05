@@ -6,7 +6,7 @@ import java.net.HttpURLConnection
 import java.net.URL
 
 /**
- * Update Check — pure core (round 23 amendment)
+ * Update Check — pure core (GLOSSARY §Distribution, round 23 amendment)
  *
  * Release Feed เดียว = GitHub Releases ของ repo สาธารณะ (ตัด draft/prerelease)
  * local ≥ published = "พร้อมอยู่แล้ว" เงียบสนิท → build ทดสอบที่นำหน้า release ไม่ถูกเตือนย้อนหลัง
@@ -154,7 +154,7 @@ object UpdateCheck {
         return now - lastCheckAt >= minIntervalMs
     }
 
-    /** dismissed ครอบ release นั้นตัวเดียว (Later ≠ ปิด Update Check) */
+    /** dismissed ครอบ release นั้นตัวเดียว (Later ≠ ปิด Update Check — GLOSSARY "Later") */
     fun shouldNotify(candidateTag: String, dismissedUpdateTag: String?): Boolean =
         candidateTag != dismissedUpdateTag
 }

@@ -29,6 +29,7 @@ import androidx.activity.OnBackPressedCallback
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.graphics.Color // value class = เทียบสีได้โดยไม่ boxing
 import androidx.compose.ui.graphics.toArgb // task 9: ChromeColors → view background (Int ARGB)
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.setViewTreeLifecycleOwner
@@ -41,6 +42,8 @@ import dev.aterminal.core.BackendError
 import dev.aterminal.core.CloseReason
 import dev.aterminal.core.Command
 import dev.aterminal.core.CommandCodec
+import dev.aterminal.core.ImeAutocomplete
+import dev.aterminal.core.ImeSuggestions
 import dev.aterminal.core.KeyPresets
 import dev.aterminal.core.KeybindingResolver
 import dev.aterminal.core.Profile
@@ -128,9 +131,10 @@ class MainActivity : ComponentActivity() {
     // task 7 (round 23): status line ของ strip เดิมย้ายเข้า top bar v2 (single row) —
     // pair (text, argb) เขียนผ่าน setStatus เท่านั้น; barSnap = input ของเมนู ∨/⋮ เขียนโดย refreshTabs
     private var statusSnap by mutableStateOf("≡ new tab — tap to connect" to 0xFF9A9A9AL)
-    private var barSnap by mutableStateOf(TopBarSnapshot(emptyList(), null, false, "webview", true))
+    // ค่า boot อ่านจาก default ของ Settings เอง — ห้าม hardcode ค่าที่สอง (เคย stale พร้อมกันสองที่รอบ 17)
+    private var barSnap by mutableStateOf(TopBarSnapshot(emptyList(), null, false, "webview", true, Settings().imeSuggestions))
 
-    // round 23 amendment (Update Check)
+    // round 23 amendment (Update Check, GLOSSARY §Distribution)
     private var appVersion: String = "?" // versionName ดิบ — CrashLog pattern เดียว (packageManager, ไม่ใช่ BuildConfig)
     private var pendingUpdate: List<UpdateCheck.Release>? = null // ผล auto ที่มาตอน background → show ตอน onResume (Q11)
     private var updateCheckInFlight = false // กัน double-tap ⋮ = สอง dialog
@@ -143,6 +147,7 @@ class MainActivity : ComponentActivity() {
         val keepCpuAwake: Boolean,
         val engine: String,
         val updateChecks: Boolean, // round 23 amendment: label สวิตช์ 🌐 ใน ⋮ (F8: ไม่มี default — source of truth เดียว = Settings ผ่าน refreshTabs)
+        val imeSuggestions: String, // HW 11-05: ค่า settings ดิบ (label สั้นที่ ImeSuggestions.short — menu ห้ามมี logic)
         // task 9: สี chrome ตาม scheme ของ pane active — คำนวณครั้งเดียวต่อ snapshot (ChromePalette)
         // ค่า default = fallback ตอน boot ก่อน pane แรก (≡ สี hard-code ยุค task 7)
         val chrome: ChromeColors = ChromeColors(),
@@ -202,6 +207,7 @@ class MainActivity : ComponentActivity() {
                         for (id in manager.ids()) manager.get(id)?.let { tab ->
                             for (p in tab.panes) if (p.native) configureNative(p, p.profile?.fontFace)
                         }
+                        applyImeSuggestions() // HW 11-05: webview pane ไม่ผ่าน configureNative จึงต้องวนเอง
                         applyKeysPreset() // ADR 0002: keysPreset เปลี่ยน = body ของ bar ถูก lay ใหม่ทันที
                         applyKeysBars()
                         toast("settings reloaded")
@@ -274,6 +280,7 @@ class MainActivity : ComponentActivity() {
                     keepCpuAwake = barSnap.keepCpuAwake,
                     engine = barSnap.engine,
                     updateChecks = barSnap.updateChecks,
+                    imeSuggestionsLabel = ImeSuggestions.short(barSnap.imeSuggestions),
                     appVersion = appVersion, // static ต่อ process — ไม่อยู่ใน snapshot ก็ได้ (ไม่ recompose ต้องการ)
                     statusText = statusSnap.first,
                     statusColor = androidx.compose.ui.graphics.Color(statusSnap.second),
@@ -475,6 +482,8 @@ class MainActivity : ComponentActivity() {
         for (id in manager.ids()) manager.get(id)?.let { tab ->
             for (p in tab.panes) if (p.native) configureNative(p, p.profile?.fontFace)
         }
+        // HW 11-05: เสียบ/ถอด physical keyboard มาทาง callback นี้ = โหมด strictOnHardware เปลี่ยนทันที (ทั้งสอง renderer)
+        applyImeSuggestions()
     }
 
     /**
@@ -1082,6 +1091,9 @@ class MainActivity : ComponentActivity() {
         val tv = s.view as? TerminalView ?: return
         tv.copyOnSelect = settings.copyOnSelect // ≡ Droid.copyOnSelect() ที่ JS ถามต่อ gesture — native อ่านตอน configure
         tv.preeditEnabled = settings.preeditEnabled // T5 kill switch: false = IME path เดิม byte-for-byte
+        tv.imeStrict = ImeSuggestions.strictNow(settings.imeSuggestions, hwKeyboardPresent()) // HW 11-05 (⌨️ ใน ⋮)
+        // view เห็น InputConnection = รู้ว่า IME ยัง compose/เติมคำอยู่ → รายงานมา counted ที่นี่ที่เดียว
+        tv.onImeAutocomplete = { kind, text -> noteImeAutocomplete(kind, text) }
         tv.palette = paletteFor(s.profile)
         tv.configure(s.fontSize * resources.displayMetrics.scaledDensity, fontFace)
         // T6 HUD ≡ Droid.findStatus (status strip เดียวกับ webview path; bar = overlay ของ wrapper)
@@ -1594,6 +1606,7 @@ class MainActivity : ComponentActivity() {
             keepCpuAwake = settings.keepCpuAwake,
             engine = settings.engine,
             updateChecks = settings.updateChecks,
+            imeSuggestions = settings.imeSuggestions,
             chrome = ChromePalette.from(pal.defaultBg, pal.defaultFg),
         )
         applyChrome(barSnap.chrome)
@@ -1603,16 +1616,25 @@ class MainActivity : ComponentActivity() {
         syncKeepAlive()
     }
 
+    /** bg ที่ root/tabBar ทาไว้แล้ว (Unspecified = ยังไม่เคย) — กัน invalidate ทั้ง window ฟรี ๆ ดู [applyChrome] */
+    private var chromeBgApplied = Color.Unspecified
+
     /**
      * task 9: ดัน chrome เข้า view ที่ Compose access ไม่ถึง — root (เนื้อรอบ ๆ/ใต้ bar) + ตัว ComposeView
      * เอง (padding area) + Keys Bar; barBg ≡ terminal bg ทำให้แถบละลายนี่งกับขอบ pane (anchor เดียวที่เป๊ะ)
      * ผู้เรียกเดียว = refreshTabs (single writer ของ snapshot — ทุก path สลับ tab/save/reload ผ่านที่นี่)
      */
     private fun applyChrome(c: ChromeColors) {
-        val bg = c.barBg.toArgb()
-        root.setBackgroundColor(bg)
-        tabBar.setBackgroundColor(bg)
-        keysBar.setChrome(c)
+        // perf 11-04: View.setBackgroundColor = setBackground(...) → requestLayout + invalidate ทั้ง window
+        // = ปลุก native onDraw ทั้ง grid; refreshTabs วิ่งทุก ACTION_DOWN ใน pane และทุก step ของ resize
+        // (rotate/IME slide/divider drag) แต่สีมักเท่าเดิม → ทาเฉพาะตอนสีเปลี่ยนจริง (≡ guard ใน ExtraKeysBar.setChrome)
+        if (chromeBgApplied != c.barBg) {
+            chromeBgApplied = c.barBg
+            val bg = c.barBg.toArgb()
+            root.setBackgroundColor(bg)
+            tabBar.setBackgroundColor(bg)
+        }
+        keysBar.setChrome(c) // self-guard ข้างใน (paint ของปุ่ม)
     }
 
     private fun syncKeepAlive() {
@@ -1658,13 +1680,134 @@ class MainActivity : ComponentActivity() {
         toast(if (settings.keepCpuAwake) "CPU stays awake while connected. Uses more battery." else "CPU may sleep while the screen is off")
     }
 
-    // ---- Update Check (round 23 amendment) ----
+    // ---- Update Check (round 23 amendment — GLOSSARY §Distribution) ----
 
     private fun toggleUpdateChecks() {
         settings = settings.copy(updateChecks = !settings.updateChecks)
         persistSettings()
         refreshTabs() // label 🌐 ใน ⋮ อ่านจาก barSnap
         toast(if (settings.updateChecks) "Update checks on — GitHub Releases, once a day" else "Update checks off — check manually anytime")
+    }
+
+    // ---- IME suggestions (HW 11-05, user request) ----
+
+    /**
+     * ⋮ → ⌨️ สลับนโยบาย "เดาคำให้" ของ IME ทั้งแอป — app ขอ `NO_SUGGESTIONS` มาตลอดแต่ IME หลัก
+     * ไม่เคารพ (strip ยังโชว์ + เติมคำให้อัตโนมัติตอนกด space = ส่งอักษรที่ user ไม่ได้พิมพ์เข้า PTY)
+     * flag ที่แรงกว่าทำให้ IME หยุด compose = พิมพ์ไทยไม่ได้ จึงต้องเป็น choice ที่ user กดสลับเอง
+     * ค่าถูก persist แล้ว re-apply ทุก pane ของทั้งสอง renderer (A/B บนเครื่องจริงได้ในไม่ถึงวินาที)
+     */
+    internal fun toggleImeSuggestions() {
+        settings = settings.copy(imeSuggestions = ImeSuggestions.next(settings.imeSuggestions))
+        persistSettings()
+        applyImeSuggestions()
+        refreshTabs() // label ⌨️ ใน ⋮ อ่านจาก barSnap
+        toast(ImeSuggestions.label(settings.imeSuggestions))
+    }
+
+    /**
+     * settings.imeSuggestions → ทุก pane (native = [TerminalView.imeStrict], webview = ImeGateWebView)
+     * physical keyboard เปลี่ยน (เสียบ/ถอด → onConfigurationChanged) ต้องเรียกใหม่: strictOnHardware
+     * ตัดสินจาก hwKeyboardPresent() ตอนเรียก = ห้าม cache ผลไว้ที่อื่น
+     */
+    private fun applyImeSuggestions() {
+        val strict = ImeSuggestions.strictNow(settings.imeSuggestions, hwKeyboardPresent())
+        for (id in manager.ids()) manager.get(id)?.let { tab ->
+            for (p in tab.panes) {
+                if (p.native) (p.view as? TerminalView)?.let { it.imeStrict = strict }
+                else (p.view as? ImeGateWebView)?.let { w -> w.strictIme = strict; w.refreshIme() }
+            }
+        }
+    }
+
+    /**
+     * ⌨️ Keyboard settings… — การตัดสินใจจริงอยู่ที่ IME ไม่ใช่ app (flag ของเราเป็นแค่คำขอ)
+     * fallback chain: หน้า subtype ของ IME ปัจจุบัน → รายการ IME → บอกล่ามือ (บาง vendor ไม่มีหน้าแรก)
+     */
+    private fun openKeyboardSettings() {
+        toast("In the keyboard app: Text correction → turn off Auto-replace and Show suggestion strip")
+        for (action in listOf(
+            android.provider.Settings.ACTION_INPUT_METHOD_SUBTYPE_SETTINGS, // javap: มี ACTION_ นำหน้า (ไม่มี variant ห้วน)
+            android.provider.Settings.ACTION_INPUT_METHOD_SETTINGS,
+        )) {
+            if (runCatching { startActivity(Intent(action).addCategory(Intent.CATEGORY_DEFAULT)) }.isSuccess) return
+        }
+        toast("Could not open it — open your keyboard app's settings (Text correction) manually")
+    }
+
+    /** key ของ prefs "ui": จำว่า *IME ตัวไหน* ถูกพาไปหน้าตั้งค่าไปแล้ว (one nudge ต่อ IME, ไม่ใช่ต่อ session) */
+    private fun prefs() = getSharedPreferences("ui", Context.MODE_PRIVATE)
+
+    /**
+     * IME ไม่เชื่อ flag ของเรา = app แก้ให้ไม่ได้ (ไม่มี API ตั้งค่าของ app อื่น) สิ่งที่ทำได้คือ
+     * พา user ไปหน้าของ IME เอง — แต่จะพาไปทุกครั้งที่จับได้เลย = ก่อกวนคนที่พิมพ์ปกติ
+     * จึงนับหลักฐานก่อน (ImeAutocomplete.HINT_AFTER ครั้ง) แล้วเตือนครั้งเดียวต่อ IME ตลอดเครื่อง
+     */
+    private var imeStrikes = 0
+
+    /** elapsedRealtime ms ของ signal composition ล่าสุด — BURST นับเฉพาะที่ตามหลังมัน (ดู ImeAutocomplete.BURST_WINDOW_S) */
+    private var lastCompositionAt = 0L
+
+    /**
+     * จุดรวมสัญญาณของสอง renderer: native = [TerminalView.onImeAutocomplete],
+     * webview = `Droid.onImeComposing` + burst ที่ [SessionBridge.onInput]
+     * (Chromium เป็นเจ้าของ InputConnection เอง = ฝั่ง webview วัดที่ PTY write ไม่ใช่ InputConnection)
+     * เรียกจากเส้น JS ได้ — งานทั้งหมด (clipboard, prefs, dialog) ต้องอยู่ main thread
+     */
+    internal fun noteImeAutocomplete(kind: ImeAutocomplete.Kind, text: String, composing: Boolean = false) {
+        runOnUiThread {
+            val hintedFor = prefs().getString(PREF_IME_HINT, null)
+            val imeId = currentImeId()
+            if (hintedFor != null && hintedFor == imeId) return@runOnUiThread // เตือนตัวนี้แล้ว = เงียบตลอด
+            val now = android.os.SystemClock.elapsedRealtime()
+            if (kind == ImeAutocomplete.Kind.COMPOSITION) lastCompositionAt = now
+            // NaN = ไม่เคยเห็น composition เลย (ห้ามตีความเป็น "0 วินาที")
+            val since = if (lastCompositionAt == 0L) Double.NaN else (now - lastCompositionAt) / 1000.0
+            val strict = ImeSuggestions.strictNow(settings.imeSuggestions, hwKeyboardPresent())
+            val counts = ImeAutocomplete.isSuggestion(kind, strict, text, composing, clipText(), since)
+            // HW 11-05 follow-up (Honor: dialog ไม่เด้งเลย) = ต้องแยก "IME ไม่ดื้อ" ออกจาก
+            // "เราวัดไม่ถึง" (strict ปิดอยู่ / bridge ไม่ยิง / composing ค้าง true) จึงบันทึก *การตัดสิน*
+            // ทุกครั้งลง IME log ที่ user คัดลอกเองได้ — เกณฑ์คือห้าม text ลง log (IME log ถูก copy ออก
+            // นอกเครื่องได้) จึงบันทึกความยาวเท่านั้น
+            imeLog("imeSug $kind len=${text.length} verdict=${if (counts) "count" else "ignore"} strict=$strict comp=$composing since=$since strikes=$imeStrikes ime=${imeId?.substringBefore('/') ?: "NONE"}")
+            if (!counts) return@runOnUiThread
+            imeStrikes++
+            if (!ImeAutocomplete.shouldHint(imeStrikes, hintedFor, imeId)) return@runOnUiThread
+            imeStrikes = 0
+            prefs().edit().putString(PREF_IME_HINT, imeId).apply() // commit ก่อน show: crash กลาง dialog ก็ไม่เด้งซ้ำ
+            imeLog("imeSug hint shown for $imeId")
+            showImeSuggestionHint()
+        }
+    }
+
+    /** identity ของ IME ที่กำลังใช้ (null = อ่านไม่ได้ = ห้ามเด้ง เพราะเราจะระงับมันในอนาคตไม่ได้) */
+    private fun currentImeId(): String? = runCatching {
+        android.provider.Settings.Secure.getString(contentResolver, android.provider.Settings.Secure.DEFAULT_INPUT_METHOD)
+    }.getOrNull()
+
+    private fun clipText(): String {
+        val clip = clipboard().primaryClip ?: return ""
+        if (clip.itemCount == 0) return ""
+        return runCatching { clip.getItemAt(0).coerceToText(this).toString() }.getOrNull() ?: ""
+    }
+
+    /**
+     * ต้องบอกสวิตช์ที่จะปิดไว้ในตัว dialog เอง — user กำลังจะถูกพาออกจากแอปไปเจอหน้าจอ IME
+     * dialog นี้ไม่สัญญาว่าจะแก้ให้ (การตัดสินใจอยู่ที่ IME) มันพาไปถูกที่เท่านั้น
+     */
+    private fun showImeSuggestionHint() {
+        closeImeForMenus() // policy task 10: dialog ทุกตัวปิด IME ก่อน (focus/IME race)
+        android.app.AlertDialog.Builder(this)
+            .setTitle("Keyboard still suggests")
+            .setMessage(
+                "A-Terminal asked your keyboard not to suggest words, and it kept going — " +
+                    "auto-completion sends characters you never typed into the terminal.\n\n" +
+                    "Only the keyboard app itself can turn this off:\n" +
+                    "Text correction → off: Auto-replace, Show suggestion strip."
+            )
+            .setPositiveButton("Open keyboard settings") { _, _ -> openKeyboardSettings() }
+            .setNegativeButton("Not now", null)
+            .showGuarded(this)
     }
 
     /**
@@ -1718,7 +1861,7 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * Update Notice: mark dismissed **เมื่อดialogขึ้นจริงเท่านั้น** (F6: showGuarded ทิ้ง dialog
+     * Update Notice (GLOSSARY): mark dismissed **เมื่อดialogขึ้นจริงเท่านั้น** (F6: showGuarded ทิ้ง dialog
      * ตอน activity ตาย = ยังไม่เคยเห็น release นี้ ห้ามเงียบตลอดไป — ครั้งถัดไปได้);
      * Download = เปิด browser_download_url ของ asset .apk ตรง ๆ (ถึงไฟล์ apk ในหนึ่งแตะ — HW 11-04)
      * View release = หน้า release; ทางติดตั้งยังเป็น browser ตามเดิมทุกประการ ไม่มี in-app installer (Q4-ก) —
@@ -2358,6 +2501,8 @@ class MainActivity : ComponentActivity() {
             OverflowItemId.licenses -> connectUi.showLicenses()
             OverflowItemId.checkUpdates -> checkUpdates(manual = true)
             OverflowItemId.updateChecksToggle -> toggleUpdateChecks()
+            OverflowItemId.imeSuggestions -> toggleImeSuggestions()
+            OverflowItemId.keyboardSettings -> openKeyboardSettings()
         }
     }
 
@@ -2505,11 +2650,39 @@ class MainActivity : ComponentActivity() {
      * session ส่งเป็น getter เพราะ bridge ถูก attach ตอน createSession ก่อน TerminalSession มี controller
      */
     inner class SessionBridge(private val session: () -> TerminalSession) {
+        /** JS รายงาน composition (terminal.html → Droid.onImeComposing) — ใช้แยก "คำที่ IME เติม" ออกจาก "คำที่ compose อยู่" */
+        @Volatile private var composing = false
+        private var funnelProven = false
+
         @JavascriptInterface
         // round 21: transform ก่อน write = Gboard تحت CTRL/⇧ ให้ผลเหมือน bar (user flow: กด CTRL ค้าง + ตัวอักษร)
-        fun onInput(text: String) {
+        // HW 11-05 follow-up: [source] = ค่าที่ JS ติดป้ายมากับก้อน (ime/bar/paste) — funnel นี้รับทุก
+        // upstream byte ไม่ใช่แค่สิ่งที่ user พิมพ์ จึงห้ามถือว่าทุกก้อนเป็นหลักฐานของ IME
+        fun onInput(text: String, source: String?) {
+            val src = source ?: ImeAutocomplete.SRC_IME
+            if (!funnelProven) { // หลักฐานว่า bridge ฝั่ง webview มีชีวิต (แยก "IME ไม่ดื้อ" จาก "เราไม่ได้ยิน")
+                funnelProven = true
+                imeLog("imeSug webview funnel alive (first write len=${text.length} src=$src)")
+            }
+            // สัญญาณ IME จริง = ก้อนจาก textarea เท่านั้น และต้องไม่มี control byte (mouse report
+            // `ESC[<32;42;12M` ของ drag ใน tmux = 12 ตัวอักษร 9 ก้อน = เคยทำให้ log หลอก)
+            if (text.length > 1 && src == ImeAutocomplete.SRC_IME && ImeAutocomplete.plausibleImeText(text)) {
+                noteImeAutocomplete(ImeAutocomplete.Kind.BURST, text, composing) // HW 11-05
+            }
             val r = mods.transform(text) // round 21: transform ก่อน write = Gboard تحت CTRL/⇧ ให้ผลเหมือน bar
             lruTouch(session()); session().controller.write(r)
+        }
+
+        /**
+         * HW 11-05: terminal.html ส่งทุก compositionstart/update (data = "" ตอน end) —
+         * Chromium เป็นเจ้าของ InputConnection เอง เราจึงวัดฝั่ง webview ได้ตรงนี้กับที่ PTY write เท่านั้น
+         */
+        @JavascriptInterface
+        fun onImeComposing(data: String) {
+            if (data.isEmpty()) { composing = false; return }
+            if (composing) return // นับครั้งเดียวต่อ region (≡ native ที่วัด !preEdit.active) — update ของคำเดิมห้ามสะสม strike
+            composing = true
+            noteImeAutocomplete(ImeAutocomplete.Kind.COMPOSITION, data, true)
         }
 
         @JavascriptInterface
@@ -2631,6 +2804,7 @@ class MainActivity : ComponentActivity() {
 
     companion object {
         private const val REQ_NOTIFICATIONS = 4101
+        private const val PREF_IME_HINT = "imeHintShownFor" // HW 11-05: จำ IME ที่ถูกพาไปตั้งค่าแล้ว
         private const val PANE_FOCUS = 0xFF3DA0FF.toInt()   // กรอบ focused pane (accent เดียวกับ theme)
         private const val CRASH_LOOP_WINDOW_MS = 15_000L    // T4: boot ใหม่ไวเกินไปหลัง restore attempt = ข้าม restore ครั้งเดียว
     }
@@ -2685,7 +2859,25 @@ private class GestureRoot(
  */
 private class ImeGateWebView(context: android.content.Context) : WebView(context) {
     @Volatile var editorEnabled = true
+    /** HW 11-05: host ตั้งตาม settings.imeSuggestions (⌨️ ใน ⋮) — เขียนทับ inputType ที่ Chromium รายงาน */
+    @Volatile var strictIme = false
     override fun onCheckIsTextEditor(): Boolean = editorEnabled && super.onCheckIsTextEditor()
-    override fun onCreateInputConnection(outAttrs: android.view.inputmethod.EditorInfo): android.view.inputmethod.InputConnection? =
-        if (editorEnabled) super.onCreateInputConnection(outAttrs) else null
+    override fun onCreateInputConnection(outAttrs: android.view.inputmethod.EditorInfo): android.view.inputmethod.InputConnection? {
+        val ic = if (editorEnabled) super.onCreateInputConnection(outAttrs) else null
+        // helper textarea ของ xterm เป็น text ธรรมดา → IME ยังเดาให้ แม้ page ปิด autocorrect
+        // mode "รหัสผ่านผ่านตา" = แบบที่ IME ส่วนใหญ่เลิกเดา (ฝั่ง native วัดแล้วว่าเลิก compose ด้วย
+        // = พิมพ์ไทยไม่ได้) user จึงเลือกเองได้ ทั้งสอง renderer ผ่านทาง ⌨️ เดียวกัน
+        if (ic != null && strictIme) {
+            outAttrs.inputType = android.text.InputType.TYPE_CLASS_TEXT or
+                android.text.InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD
+        }
+        return ic
+    }
+
+    /** ให้ IME อ่าน EditorInfo ใหม่ตอน strict เปลี่ยนระหว่างคีย์บอร์ดเปิดอยู่ */
+    fun refreshIme() {
+        runCatching {
+            context.getSystemService(android.view.inputmethod.InputMethodManager::class.java)?.restartInput(this)
+        }
+    }
 }

@@ -174,11 +174,25 @@ if (document.fonts && document.fonts.load) {
   ]).then(settle);
 }
 
+// HW 11-05 follow-up: Droid.onInput ต้องรู้ว่าก้อนนี้มาจากไหน — funnel เดียวกันรับทั้งการพิมพ์ (ime),
+// Keys Bar preset (bar) และ ⚡/clip (paste) = "bytes ทุกก้อนที่ upstream" ไม่ใช่ "สิ่งที่ user พิมพ์"
+// ป้ายต้อง sticky ชั่วคราว เพราะ xterm finalize data ได้ช้าถึง setTimeout(0) = set/reset ครอบ
+// term.input() อย่างเดียวไม่ครอบคลุม (landmine เดียวกับที่บันทึกใน AtermMods.pre) → จึงหมดอายุเอง
+// ใน 30ms และผู้บริโภคคลียร์เมื่ออ่าน; ถ้าป้ายค้างแล้วถูกก้อนถัดไปกิน = under-report = ทิศที่ปลอดภัย
+var AtermSrc = (function () {
+  var tag = null, timer = 0;
+  return {
+    set: function (t) { tag = t; clearTimeout(timer); timer = setTimeout(function () { tag = null; }, 30); },
+    take: function () { clearTimeout(timer); const t = tag; tag = null; return t || 'ime'; },
+  };
+})();
+
 // round 7 gate: markMode on = ทุก byte ผ่าน AtermKeys ก่อน (enter=copy, esc=exit, arrows=เลื่อน selection)
 term.onData(data => {
   if (window.AtermKeys && AtermKeys.consumeIfMarkMode(data)) return;
+  const src = window.AtermSrc ? AtermSrc.take() : 'ime'; // take() ทุกก้อน: dedup กลืนก้อนแล้วป้ายต้องไม่หลุดไปก้อนถัดไป
   // round 21: AtermMods.pre = dedup commit-ซ้ำทั้งคำของ Gboard (rw) — null/ว่าง = กลืนทั้งก้อน
-  if (window.Droid) { const d = (window.AtermMods && AtermMods.pre) ? AtermMods.pre(data) : data; if (d) Droid.onInput(d); }
+  if (window.Droid) { const d = (window.AtermMods && AtermMods.pre) ? AtermMods.pre(data) : data; if (d) Droid.onInput(d, src); }
 });
 // R4 mouse: report แบบ X10/VT200 ที่ไม่ขอ 1006 ออกทาง onBinary (latin1, coord >127 จะพังผ่าน String bridge)
 // — ส่ง base64 ไป decode ฝั่ง Kotlin; SGR (1006 = tmux/htop) วิ่ง onData เองแล้ว
@@ -207,9 +221,23 @@ var AtermMods = (function () {
       ta = term.textarea;
       if (!ta) return;
       var diverged = function () { if (rw && ta.value.indexOf(rw) !== 0) rw = ''; }; // คำเปลี่ยน (backspace/autocorrect/คำใหม่) = dedup ใช้ไม่ได้
-      ta.addEventListener('compositionstart', function () { composing = true; diverged(); if (active) flush(); });
-      ta.addEventListener('compositionupdate', function () { composing = true; diverged(); if (active) flush(); });
-      ta.addEventListener('compositionend', function () { composing = false; });
+      // HW 11-05: รายงาน composition ให้ Kotlin นับ "IME ไม่เชื่อ flag" (password mode = ต้องไม่มี
+      // composing region) — ส่ง data จริง (start มักว่าง, update มีคำ), end = '' เพื่อปิดสถานะ
+      function reportIme(e) {
+        if (!window.Droid || !Droid.onImeComposing) return;
+        try { Droid.onImeComposing((e && e.data) || ''); } catch (x) {}
+      }
+      ta.addEventListener('compositionstart', function (e) { composing = true; reportIme(e); diverged(); if (active) flush(); });
+      ta.addEventListener('compositionupdate', function (e) { composing = true; reportIme(e); diverged(); if (active) flush(); });
+      ta.addEventListener('compositionend', function (e) { composing = false; reportIme(e); });
+      // HW 11-05 follow-up: ถ้า compositionend ของ stackไหนไม่มา Kotlin จะค้างในสถานะ composing
+      // แล้วกลืน burst ทั้งหมด = ไม่เด้งเลย (เจอบน Honor) — input event มี isComposing จริงจาก
+      // Chromium อยู่แล้ว จึง sync สถานะทุก key ด้วย (end ที่หลุดหายจะถูกปิดที่นี่)
+      ta.addEventListener('input', function (e) {
+        if (typeof e.isComposing !== 'boolean') return;
+        if (e.isComposing) reportIme(e);
+        else if (composing) { composing = false; reportIme(null); }
+      });
     },
     // ตัวกรองก่อน Droid.onInput (term.onData เรียกทุกก้อน):
     //  - ก้อน commit ทั้งคำที่ upต้น = rw (ตัวที่เขียนไปแล้ว) → ตัด prefix ส่งเฉพาะหาง (ว่าง = กลืนทั้งก้อน)
@@ -409,7 +437,8 @@ window.Aterm = {
     // แสดงผลจริงอยู่ที่ status strip ฝั่ง native — JS แค่เก็บไว้ใช้ decorate ได้
     window.__atermStatus = json;
   },
-  paste: function (text) { term.paste(text); },
+  // HW 11-05: ป้าย paste = ก้อนนี้ user สั่งวางเอง (ทั้ง ⚡ และ clip) ไม่ใช่คำที่ IME เติม
+  paste: function (text) { if (window.AtermSrc) AtermSrc.set('paste'); term.paste(text); },
   setFont: function (px) { term.options.fontSize = px; fit(); },
   // round 15-HW: profile.fontFace เคยขาดทางไป webview (มีแค่ fontSize ข้าม bridge) — เพิ่มตัวนี้
   // Kotlin ส่ง JSON-string ที่ quote แล้ว; `window.Aterm &&` ฝั่ง caller = fail-soft ถ้า asset เก่าค้าง cache

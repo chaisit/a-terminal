@@ -58,6 +58,7 @@ enum class OverflowItemId {
     keepCpuAwake, renderer, fontMinus, fontPlus,
     copyConnectionLog, copyImeLog, exportSettings, importSettings, licenses,
     checkUpdates, updateChecksToggle, // round 23 amendment (Update Check) — dispatch เดียวผ่าน onOverflow
+    imeSuggestions, keyboardSettings, // HW 11-05: นโยบาย suggestion ของ IME + ทางลัดตั้งค่า IME (dispatch เดียวกัน)
 }
 
 /**
@@ -89,6 +90,7 @@ fun ATerminalTabBar(
     keepCpuAwake: Boolean,
     engine: String,
     updateChecks: Boolean,  // round 23 amendment: label สวิตช์ "Update checks" ใน ⋮ (อ่านจาก barSnap)
+    imeSuggestionsLabel: String, // HW 11-05: คำสั้นของ settings.imeSuggestions (short() อยู่ที่ ImeSuggestions — เมนูห้ามมี logic)
     appVersion: String,     // versionName ดิบ (ไม่มี v) — บรรทัดท้ายเมนู ⋮
     statusText: String,
     statusColor: Color,
@@ -296,6 +298,10 @@ fun ATerminalTabBar(
                 ) { overflowMenu = false; onOverflow(OverflowItemId.renderer) }
                 OverflowEntry("A− Font size −", chrome) { overflowMenu = false; onOverflow(OverflowItemId.fontMinus) }
                 OverflowEntry("A+ Font size +", chrome) { overflowMenu = false; onOverflow(OverflowItemId.fontPlus) }
+                OverflowEntry("⌨️ Keyboard suggestions: " + imeSuggestionsLabel, chrome) {
+                    overflowMenu = false; onOverflow(OverflowItemId.imeSuggestions)
+                }
+                OverflowEntry("⌨️ Keyboard settings…", chrome) { overflowMenu = false; onOverflow(OverflowItemId.keyboardSettings) }
                 OverflowEntry("🔍 Copy connection log", chrome) { overflowMenu = false; onOverflow(OverflowItemId.copyConnectionLog) }
                 OverflowEntry("Copy IME log", chrome) { overflowMenu = false; onOverflow(OverflowItemId.copyImeLog) }
                 OverflowEntry("⬇ Export settings.json", chrome) { overflowMenu = false; onOverflow(OverflowItemId.exportSettings) }

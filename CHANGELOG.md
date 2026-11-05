@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.5.10
+
+Everything that landed since 0.5.2 ships here. The builds in between were tested on real devices but
+were never published, so their changes are collected in this one release.
+
+### Keyboard suggestions
+
+- **Autocomplete and the suggestion strip are off by default.** The terminal now asks the keyboard for
+  no suggestions at all, so a word you did not type stops landing at the cursor. **⋮ → ⌨️ Keyboard
+  suggestions** cycles the policy whenever you like: **strict** (never suggest), **strict on HW kb**
+  (strict only while a physical keyboard is connected) and **app default**.
+- **The cost, said out loud:** while **strict** is active, some keyboards also stop composing — so a
+  language that needs a composing sequence (Thai, Hindi, …) cannot be typed on the touch keyboard.
+  Switch to **strict on HW kb** or **app default** if you need composing.
+- **If your keyboard ignores the request, the app walks you to the switch.** An app cannot change
+  another app's settings, and some keyboards keep suggesting anyway. After seeing it twice, you get a
+  dialog naming the switches to turn off (on Gboard: **Text correction → Auto-replace** and **Show
+  suggestion strip**) with a button that opens your keyboard's settings page. Once per keyboard, ever.
+- **⌨️ Keyboard settings…** in the **⋮** menu opens that page on demand, no detection needed.
+
+### Native renderer
+
+- **Drawing is measurably faster on high-DPI screens.** The renderer used to shape text once per
+  character cluster on every frame; it now draws a run of same-styled cells in one pass and repaints
+  only what actually changed, so a screenful of Thai text or a blinking cursor no longer costs
+  thousands of layout calls per frame.
+- **Box drawing stays aligned next to Thai text.** A run containing a glyph the bundled font does not
+  carry was measured with the wrong advance, which pushed a closing `│` a few pixels to the left. The
+  renderer now measures each run's real width and falls back to cell-by-cell anchoring only when it
+  does not match the grid — box-heavy screens (htop, vim) keep the single-pass path.
+- Two further fixes here are for regressions introduced and fixed inside this same unpublished
+  stretch (a `drawText` range argument that is an exclusive end, not a count, threw on one device;
+  and the per-cluster shaping above was itself a slowdown before it was fixed). No released version
+  had either symptom.
+
 ## 0.5.2
 
 - **Update notices now download the APK with one tap.** The "Update available" dialog has a new

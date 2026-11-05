@@ -37,8 +37,13 @@ android {
         // update check (GitHub Releases: auto 1×/วัน + manual, cumulative changelog — release แรกที่จะถูกเช็คเจอ = release ถัดไป)
         // 0.5.1 (code 20): ผลทดสอบเครื่องจริงบน 0.5.0 — ตัด pinch-to-zoom ออก (ขนาดตัวยังอยู่ที่ ⋮ ตามเดิม)
         // 0.5.2 (code 21): Update Notice เพิ่มปุ่ม Download <tag> เปิดไฟล์ apk ตรงจาก browser_download_url
-        versionCode = 21
-        versionName = "0.5.2"
+        // 0.5.3–0.5.5 (code 22–24): native renderer — redraw per cluster was too slow for Thai text on
+        // high-DPI screens; a partial-range drawText argument behaved as an exclusive end, not a count
+        // (crash on one device), and runs drawn with a fallback font needed per-cell anchoring to stay aligned
+        // 0.5.6–0.5.10 (code 25–29): keyboard suggestions — settings.imeSuggestions (default now strict),
+        // ⌨️ toggle + Keyboard settings… in the ⋮ menu, and a one-time hint per keyboard when it ignores the flag
+        versionCode = 29
+        versionName = "0.5.10"
     }
 
     signingConfigs {

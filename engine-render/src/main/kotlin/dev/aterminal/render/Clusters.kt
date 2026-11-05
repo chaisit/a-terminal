@@ -20,19 +20,30 @@ object Clusters {
     /** engine-cell clusters ตามลำดับ ("" → empty list) */
     fun split(s: String): List<String> {
         val out = ArrayList<String>()
+        forEach(s) { a, b -> out.add(s.substring(a, b)) }
+        return out
+    }
+
+    /**
+     * walk เดียวกับ [split] แต่ส่ง (start, end) ของแต่ละ cluster ให้ callback — **ไม่ alloc list
+     * และไม่ alloc substring ต่อ cluster** (วาดทั้งจอ = ~1 cluster ต่อ cell ต่อเฟรม — allocation
+     * ชุดนี้คือ GC churn ที่วัดได้จากอาการกระตุกของ native renderer)
+     * inline = lambda ที่ call site ถูก inline = zero allocation จริง
+     */
+    inline fun forEach(s: CharSequence, onCluster: (start: Int, end: Int) -> Unit) {
         var start = 0
         var headSeen = false // cluster ปัจจุบันมี printable head หรือยัง (zero-width ล้วน =รับ non-starter ตัวถัดไปได้)
         var i = 0
         while (i < s.length) {
-            val cp = s.codePointAt(i)
+            val cp = Character.codePointAt(s, i)
             val w = Unicode.width(cp)
             if (w != 0 || !headSeen) {
-                if (i > start) { out.add(s.substring(start, i)); start = i }
+                if (i > start) onCluster(start, i)
+                start = i
                 if (w != 0) headSeen = true
             }
             i += Character.charCount(cp)
         }
-        if (start < s.length) out.add(s.substring(start))
-        return out
+        if (start < s.length) onCluster(start, s.length)
     }
 }

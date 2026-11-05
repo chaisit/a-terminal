@@ -44,7 +44,7 @@ class ImeHeuristic(val shrinkRatio: Float = 0.25f) {
  *             ไม่งั้น fit()/JS resize chain ตาย = regression ทั้ง round 3–4)
  *  fallback = ImeHeuristic บน layout size ของ root — ใช้จนกว่า insets จะ show ime=true สักครั้ง
  *             (insets ที่ report แต่ false เสมอใต้ adjustResize = ไม่มีประโยชน์, อย่าเชื่อ)
- * device gate: วัดบน emulator ว่าจะรันตัวไหนจริง แล้ว finalize ใน test report ของรอบ
+ * device gate: measured on the emulator to see which one actually runs, then settled there
  */
 class KeyboardWatcher(private val root: View) {
 

@@ -31,6 +31,12 @@ data class Settings(
     // non-WT extension (round 11 T5): native preedit hold (≡ xterm composition — G8) vs path เดิม feed-ทันที
     // ค่าเดิม true = preedit thật; false = emergency rollback กลับ native IME path เก่า byte-for-byte (เฉพาะ engine=native)
     val preeditEnabled: Boolean = true,
+    // non-WT extension (HW 11-05): คำสั่งของ app ต่อ IME เรื่อง "เดาคำให้" — ค่าที่เป็นไปได้ + ความหมาย
+    // อยู่ที่ ImeSuggestions (none / strict / strictOnHardware); ค่าไม่รู้จัก = พฤติกรรมที่ shipped มาตลอด
+    // default = strict (user ตัดสิน 11-05 หลังวัดบน Tab S10+ + Honor): ขอ flag แรงสุดเสมอ = IME ที่เชื่อ
+    // ปิด strip ให้เองตั้งแต่เปิด app; เครื่องที่ IME ไม่เชื่อ = ImeAutocomplete พาไปปิดใน IME เองหนึ่งครั้ง
+    // และ IME ที่เชื่อจะไม่ compose = พิมพ์ไทยไม่ได้บนจอสัมผัส → ⋮ ⌨️ สลับกลับ strictOnHardware/none ได้
+    val imeSuggestions: String = ImeSuggestions.STRICT,
     // non-WT extension (round 13 T4, user อนุมัติ toggle): เปิด tab + auto-reconnect ตามโครงเดิมหลัง process death
     // WT schema ไม่มี field restore ตรงตัว (startupActions:2543 = action grammar, ไม่ใช่ session state) → extension by precedent
     // ค่าเดิม true; false = boot เดิม (tab ว่างตัวเดียว) ทุกอย่างเหมือน round ≤12
@@ -45,10 +51,10 @@ data class Settings(
     // non-WT extension (round 23 chrome, ADR 0002): hardware keyboard เชื่อมต่อ/เปิด = ยุบ Keys Bar คืนพื้นที่ grid
     // WT ไม่มี concept นี้ (คีย์บอร์ดจริงคือ default ของ desktop) — ค่าเดิม false = bar แสดงเสมอเหมือนเดิมทุกตัวอักษร
     val hideKeysBarOnHardwareKeyboard: Boolean = false,
-    // non-WT extension (round 23 amendment): Update Check opt-out —
+    // non-WT extension (round 23 amendment, GLOSSARY §Distribution): Update Check opt-out —
     // ค่าเดิม true = auto ≤1×/วัน; manual จาก ⋮ ไม่ถูกบล็อกโดย field นี้ (UpdateCheck.shouldAutoCheck)
     val updateChecks: Boolean = true,
-    // release ที่ user เคยเห็น/กด Later (Update Notice = ครั้งเดียวต่อ release)
+    // release ที่ user เคยเห็น/กด Later (Update Notice = ครั้งเดียวต่อ release — "Later" ใน GLOSSARY)
     // ห้ามเทียบกับ semantic version ที่นี่ — เทียบ tag ตรงตัว, release ใหม่กว่า = tag ต่าง = เตือนได้
     val dismissedUpdateTag: String? = null,
     // epoch-ms ของการเช็คครั้งล่าสุด (auto throttle 1×/วัน) — machine state ที่ persist ตามธรรมเนียม

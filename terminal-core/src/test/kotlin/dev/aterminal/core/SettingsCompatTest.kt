@@ -29,9 +29,9 @@ class SettingsCompatTest {
         "list": [
           { "guid": "scaffold-demo", "name": "Echo (scaffold)", "type": "echo", "hidden": false },
           { "guid": "termux-local", "name": "Termux (local)", "type": "termux", "hidden": false,
-            "note": "ต้องมี Termux + sshd บน localhost:8022" },
+            "note": "requires Termux running sshd on localhost:8022" },
           { "guid": "lab-host", "name": "Lab (host sshd)", "type": "ssh", "host": "10.0.2.2", "port": 22,
-            "user": "kai", "authMethod": "key", "keyAlias": null }
+            "user": "tester", "authMethod": "key", "keyAlias": null }
         ]
       },
       "keybindings": [
@@ -127,6 +127,22 @@ class SettingsCompatTest {
         assertTrue(SettingsLoader.parse("""{"profiles":{"list":[]}}""").backAsEscape)
         assertTrue(SettingsLoader.parse(shippedJson).backAsEscape) // ไฟล์จริงที่ ship ก็ต้องได้ true
         assertFalse(SettingsLoader.parse("""{"backAsEscape":false}""").backAsEscape) // ปิดได้ด้วยการตั้งค่าเอง
+    }
+
+    // HW 11-05 (user request): นโยบาย "เดาคำให้" ของ IME = string enum (ความหมายของแต่ละค่าอยู่ที่ ImeSuggestions)
+    // default strictOnHardware = behavior change เทียบ <=0.5.5 เฉพาะตอนมี physical keyboard
+    // default = strict ตั้งแต่ 0.5.7 (user ตัดสิน 11-05): ไฟล์ที่ ship ไม่มี key นี้ = ต้องได้ strict
+    @Test fun `imeSuggestions defaults to strict and keeps unknown values raw`() {
+        assertEquals(ImeSuggestions.STRICT, SettingsLoader.parse("""{"profiles":{"list":[]}}""").imeSuggestions)
+        assertEquals(ImeSuggestions.STRICT, SettingsLoader.parse(shippedJson).imeSuggestions)
+        assertTrue("strict ต้องมีผลจริงทั้งบนจอสัมผัสและคีย์บอร์ดกายภาพ",
+            ImeSuggestions.strictNow(ImeSuggestions.STRICT, false) && ImeSuggestions.strictNow(ImeSuggestions.STRICT, true))
+        assertEquals(ImeSuggestions.NONE, SettingsLoader.parse("""{"imeSuggestions":"noSuggestions"}""").imeSuggestions)
+        // model เก็บ raw เสมอ (ห้าม normalize ตอน parse — ค่าจากเวอร์ชันใหม่ต้องไม่ถูกเขียนทับตอน save)
+        val weird = SettingsLoader.parse("""{"imeSuggestions":"strictish"}""")
+        assertEquals("strictish", weird.imeSuggestions)
+        assertEquals("ค่าไม่รู้จักต้องแปลเป็น shipped behaviour", ImeSuggestions.NONE, ImeSuggestions.parse(weird.imeSuggestions))
+        assertEquals(weird, SettingsLoader.parse(SettingsLoader.render(weird))) // round-trip ไม่หาย
     }
 
     @Test fun `hideKeysBarOnHardwareKeyboard defaults false and parses true`() {
