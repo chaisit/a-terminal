@@ -98,7 +98,7 @@ class KeyboardWatcher(private val root: View) {
         ViewCompat.setOnApplyWindowInsetsListener(root) { _, insets ->
             // edge-to-edge (targetSdk 35 บน API35: fullscreen flag ถูก ignore → bars โผล่จริง):
             // root padding = systemBars∪cutout (top) และ BarInsets.rootBottom (bottom — round 23:
-            // IME ปิด root ไม่กันล่าง nữa, keysBar รับ barsBottom เอง = bar background ลามใต้ gesture pill
+            // IME ปิด root ไม่กันล่าง อีก, keysBar รับ barsBottom เอง = bar background ลามใต้ gesture pill
             // + fix wave A2: สอง bar GONE = root รับ barsBottom กลับ)
             // ใต้ API34+fullscreen: inset ทั้งคู่ = 0 → padding 0 = พฤติกรรมเดิมทุกตัวอักษร
             // ใต้ API34+adjustResize: IME = window หด, ime() report 0 (-heuristic ขับ) → ไม่ double-shrink

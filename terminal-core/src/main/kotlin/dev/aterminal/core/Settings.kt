@@ -29,7 +29,7 @@ data class Settings(
     // true = ถือ partial wake lock ตลอดที่มี session กัน CPU หลับจน server ตัด แลกกับแบตเตอรี่
     val keepCpuAwake: Boolean = false,
     // non-WT extension (round 11 T5): native preedit hold (≡ xterm composition — G8) vs path เดิม feed-ทันที
-    // ค่าเดิม true = preedit thật; false = emergency rollback กลับ native IME path เก่า byte-for-byte (เฉพาะ engine=native)
+    // ค่าเดิม true = preedit จริง; false = emergency rollback กลับ native IME path เก่า byte-for-byte (เฉพาะ engine=native)
     val preeditEnabled: Boolean = true,
     // non-WT extension (HW 11-05): คำสั่งของ app ต่อ IME เรื่อง "เดาคำให้" — ค่าที่เป็นไปได้ + ความหมาย
     // อยู่ที่ ImeSuggestions (none / strict / strictOnHardware); ค่าไม่รู้จัก = พฤติกรรมที่ shipped มาตลอด
@@ -101,6 +101,10 @@ data class Profile(
     val padding: String = "8,8,8,8",
     val tabTitle: String? = null,
     val icon: String? = null,
+    // --- non-WT extensions (tmux/05): like authMethod/keyAlias — WT readers ignore ---
+    // tmuxKeys = show prefix button + quick-keys bar; tmuxPrefix = "C-a"-form override, null = C-b
+    val tmuxKeys: Boolean = false,
+    val tmuxPrefix: String? = null,
 )
 
 @Serializable

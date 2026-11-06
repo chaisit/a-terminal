@@ -30,6 +30,11 @@ object TestSshServer {
     const val HEARTBEAT_NAME = "keepalive@openssh.com"
 
     val recordedWindows = CopyOnWriteArrayList<Pair<Int, Int>>()
+    // ticket tmux/01: exec request (startup.commandline) ต้องถึง server ตรง ๆ — จับ string ที่ client ส่งมา
+    val recordedCommands = CopyOnWriteArrayList<String>()
+    // pty-req แรกของ channel (cols,rows) — ทางเดียวที่ assert ขนาด PTY ฝั่ง server ได้จริง
+    // (ข้อสังเกต 2.14.0: Environment ของ exec Command ไม่มี COLUMNS/LINES seeding — อย่าวัดขนาดจาก env)
+    val recordedPtyReqs = CopyOnWriteArrayList<Pair<Int, Int>>()
 
     /**
      * half-open จำลองบน JVM (T2 gate): เมื่อเปิด flag, server รับ keepalive request แล้วยุบเงียบ —
@@ -41,6 +46,15 @@ object TestSshServer {
      */
     @Volatile var deafToHeartbeat = false
     val heartbeatSeen = java.util.concurrent.atomic.AtomicInteger(0)
+
+    /**
+     * ticket tmux/02: set = exec `tmux -V` (probe) ตอบ canned output นี้แล้ว exit 0 (≡ tmux จริง/ไม่มี tmux จริง)
+     * commandFactory ของ 2.14.0 **ไม่ได้เห็น command string** (FACT — ดู signature) → peek recordedCommands ตัวล่าสุด
+     * ปลอดภัยเพราะ client **start probe หลัง main channel open().verify() จบเท่านั้น** — main exec (ถ้ามี)
+     * ถูก record+create บน request เดียวกันก่อนเสมอ; probe ตัวเดียวต่อ connection (SshBackend เรียกครั้งเดียว)
+     * ถ้า probe เคยถูกยิงขนานหลายเส้น ต้อง key ด้วย token ต่อ channel แทน (review tmux/02)
+     */
+    @Volatile var versionOutput: String? = null
 
     // SAM explicit (abstract method ชื่อ process ไม่ใช่ SAM ชื่อ interface — Kotlin ไม่ infer Lambda ให้)
     private val heartbeatSpy = object : RequestHandler<org.apache.sshd.common.session.ConnectionService> {
@@ -60,8 +74,11 @@ object TestSshServer {
 
     fun start(): SshServer {
         recordedWindows.clear()
+        recordedCommands.clear()
+        recordedPtyReqs.clear()
         deafToHeartbeat = false
         heartbeatSeen.set(0)
+        versionOutput = null
         val server = SshServer.setUpDefaultServer()
         server.port = 0 // ephemeral
         server.keyPairProvider = SimpleGeneratorHostKeyProvider(
@@ -72,7 +89,11 @@ object TestSshServer {
         server.setPublickeyAuthenticator { u, _, _ -> u == USER }
         // shell request → ShellFactory (ไม่ใช่ CommandFactory — ตัวนั้นคือ exec)
         server.shellFactory = org.apache.sshd.server.shell.ShellFactory { _ -> EchoShell() }
-        server.commandFactory = CommandFactory { _, _ -> EchoShell() }
+        // ticket tmux/02: exec "tmux -V" (probe) = canned output เมื่อ versionOutput ถูก set (ดู peek-note ด้านบน)
+        server.commandFactory = CommandFactory { _, _ ->
+            val canned = versionOutput
+            if (canned != null && recordedCommands.lastOrNull() == PROBE_COMMAND) CannedCommand(canned) else EchoShell()
+        }
         server.channelFactories = listOf(RecordingSessionFactory)
         // handler ของเราอยู่หน้าสุด — Unsupported แล้ว framework จะไล่ handler ถัดไปเอง (sources: globalRequest loop)
         server.globalRequestHandlers = listOf(heartbeatSpy) + (server.globalRequestHandlers ?: emptyList())
@@ -82,6 +103,31 @@ object TestSshServer {
 
     /** banner ที่ EchoShell พิมพ์เมื่อ start — "TESTBANNER <cols>x<rows>" */
     const val BANNER_PREFIX = "TESTBANNER "
+
+    /** คำสั่ง probe ที่ SshBackend ต้องยิงต่อ connection (tmux/02) — test assert ตรง string นี้ */
+    const val PROBE_COMMAND = "tmux -V"
+}
+
+/**
+ * ticket tmux/02: exec command ที่ตอบ output กำหนดเองครั้งเดียวแล้ว exit 0 (≡ `tmux -V` จริงบน server)
+ * output = untrusted string ได้ตาม test (รวม garbage ที่ parser ต้อง fail-soft)
+ */
+class CannedCommand(private val output: String) : Command {
+    private var exit: ExitCallback? = null
+    private var out: OutputStream? = null
+
+    override fun setInputStream(stream: InputStream) {}
+    override fun setOutputStream(stream: OutputStream) { out = stream }
+    override fun setErrorStream(stream: OutputStream) {}
+    override fun setExitCallback(callback: ExitCallback) { exit = callback }
+
+    override fun start(channel: ChannelSession, env: Environment) {
+        out?.write(output.toByteArray())
+        out?.flush()
+        exit?.onExit(0)
+    }
+
+    override fun destroy(channel: ChannelSession) {}
 }
 
 class EchoShell : Command {
@@ -122,6 +168,12 @@ class EchoShell : Command {
                                 exit?.onExit(0)
                                 break
                             }
+                            // review tmux/01: "fail" = จบด้วย exit ≠ 0 (เคส command typo / tmux lost server)
+                            if (line.toString().trim() == "fail") {
+                                running = false
+                                exit?.onExit(3)
+                                break
+                            }
                             line.setLength(0)
                         } else line.append(c)
                     }
@@ -151,4 +203,18 @@ class RecordingChannelSession : ChannelSession() {
         return super.handleWindowChangeParsed(width, height, pxWidth, pxHeight)
     }
 
+    // 2.14.0 วัดจริง (ขัด javap param-name เดิม): arg แรก = request name "exec", arg สอง = ตัวคำสั่ง
+    override fun handleExecParsed(request: String, command: String): RequestHandler.Result {
+        TestSshServer.recordedCommands.add(command)
+        return super.handleExecParsed(request, command)
+    }
+
+    // 2.14.0: param ต้องเป็น Kotlin Map (Java Map = override ไม่ match — วัดจริงตอน compile)
+    override fun handlePtyReqParsed(
+        term: String, columns: Int, rows: Int, width: Int, height: Int,
+        modes: Map<org.apache.sshd.common.channel.PtyMode, Int>,
+    ): RequestHandler.Result {
+        TestSshServer.recordedPtyReqs.add(columns to rows)
+        return super.handlePtyReqParsed(term, columns, rows, width, height, modes)
+    }
 }

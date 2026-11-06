@@ -114,6 +114,9 @@ class MainActivity : ComponentActivity() {
     private lateinit var tabBar: ComposeView
     // round 21: keys-bar modifier (CTRL/⇧) — ตัวเดียวทั้ง activity, แปลง input ทุกทางของ active pane
     private val mods = KeyModifierState()
+    // ticket tmux/05: prefix-pending state (singleton ตาม mods — pending ตัวเดียว ≡ นิ้วจริง)
+    private val tmuxPrefix = TmuxPrefixState()
+    private val tmuxHandler = android.os.Handler(android.os.Looper.getMainLooper())
     private lateinit var keysBar: ExtraKeysBar
     private lateinit var miniBar: MiniKeysBar
     private lateinit var keyboardWatcher: KeyboardWatcher
@@ -317,6 +320,7 @@ class MainActivity : ComponentActivity() {
             onKey = { key -> routeKey(key) },
             onKeyboardToggle = { toggleKeyboard() }) // Manual Reveal (ADR 0001): ⌨ = ทาง reveal เดียว
         root.addView(keysBar)
+        tmuxPrefix.onChange = { runOnUiThread { updateTmuxBar() } } // bridge thread ได้ — bar สลับ pending row บน main
         // C12: landscape + IME เปิด → หดเหลือ mini bar (portrait / IME ปิด = layout เดิม 100%)
         miniBar = MiniKeysBar(this,
             onKey = { key -> routeKey(key) },   // seam เดียวกับ bar เต็ม (round 7: markMode divert ใน routeKey)
@@ -579,7 +583,13 @@ class MainActivity : ComponentActivity() {
      * closeImeIfSneaked (ปิดวาล์ว → hide → restartInput) กัน vendor stack จำ viewClicked แล้ว reopen
      */
     private fun toggleKeyboard() {
-        if (currentFocus is android.widget.EditText) return // find bar/dialog มี IME flow ของตัวเอง
+        // fix tmux/05 (E2E 11-05): Chromium สร้าง surrogate EditText ของมันเอง *ภายใน* ImeGateWebView
+        // เพื่อถือ InputConnection (เห็นเป็น [focused] ทั้งใน a11y tree) — ตรวจหยาบ ๆ "currentFocus is
+        // EditText" จึงกลืน surrogate = ⌨ ตายทั้งปุ่มหลัง focus restore (emulator วัดจริง) —
+        // ที่ yield จริงคือ EditText ที่ app สร้างเอง (find bar/dialog = raw `EditText(ctx)` 4 จุด,
+        // มี IME flow ของตัวเอง) ซึ่งไม่มี WebView เป็น ancestor
+        val f = currentFocus
+        if (f is android.widget.EditText && !f.hostedInTerminalWebView()) return
         val s = activePane() ?: return
         if (!imeUp) { revealIme(s); return }
         imeUserRequested = false // user สั่งปิด — protection สิ้นสุดทันที (transition up→down cleanup ตามปกติ)
@@ -1030,7 +1040,7 @@ class MainActivity : ComponentActivity() {
         val tv = TerminalView(this).apply {
             setBackgroundColor(0xFF0C0C0C.toInt())
             visibility = View.INVISIBLE
-            preFeedTransform = { mods.transform(it) } // round 21: native IME ก็ผ่าน modifier (funnel เดียวกับ webview onInput)
+            preFeedTransform = { tmuxPrefix.transform(mods.transform(it)) } // round 21: native IME ก็ผ่าน modifier (funnel เดียวกับ webview onInput; tmux/05 pending ครอบ)
             preemptComposition = { mods.anyActive() } // modifier active = tap ถัดไปคือ shortcut → feed ทันที ไม่เข้า preedit
         }
         val s = TerminalSession(tv, null)
@@ -1209,7 +1219,7 @@ class MainActivity : ComponentActivity() {
         }
         val s = activePane() ?: return
         // round 21: modifier (CTRL/⇧ ค้างหรือ latch) แปลงทุก byte จาก bar — funnel เดียวกับที่ Gboard ใช้
-        val t = mods.transform(key)
+        val t = tmuxPrefix.transform(mods.transform(key)) // tmux/05: pending buffer ครอบ mods (ลำดับตายตัว: C-b C-d = 0x02 0x04)
         val tv = if (markOn.contains(s)) s.view as? TerminalView else null
         if (tv != null) {
             // native (T7): state = MarkStateMachine ใน view — unmatched = view exit(clear) เอง (onMarkMode ถอด markOn) แล้วเรากลับ path write
@@ -1561,6 +1571,7 @@ class MainActivity : ComponentActivity() {
     /** สลับ container ทั้ง tab ด้วย visibility (ไม่ re-parent — กัน InputConnection หลุดตาม round 4) */
     private fun showActive() {
         mods.clearLatches() // round 21: latch ของ pane เก่าหมดความหมายเมื่อ layout/scope เปลี่ยน (กัน ✓ ค้างต่าง pane)
+        tmuxPrefix.disarm() // tmux/05: Q5 — สลับ tab/pane = pending ยกเลิก (นิ้วตามไปกดที่ pane ใหม่ไม่ได้)
         for (id in manager.ids()) {
             val tv = tabViews[id] ?: continue
             tv.container.visibility = if (id == manager.activeId) View.VISIBLE else View.INVISIBLE
@@ -1570,6 +1581,70 @@ class MainActivity : ComponentActivity() {
         activePane()?.let { focusFollowIme(it) }
         renderActiveStatus()
         refreshTabs()
+        updateTmuxBar() // tmux/05: profile ของ pane ใหม่อาจเปิด/ปิด mode (bar snapshot เปลี่ยนทันที)
+    }
+
+    /**
+     * ticket tmux/04: จุดเดียวที่รับ title จาก terminal (webview = Droid.onTerminalTitle, native = engine.onOsc)
+     * trailing debounce 500ms ต่อ pane: tmux prompt ยิง OSC ถี่ → chrome refresh ≤1 ครั้ง/window, ค่าล่าสุดชนะ
+     */
+    private val titleHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private fun noteTerminalTitle(s: TerminalSession, raw: String) {
+        // offer+arm อยู่ใน lock เดียวกับ pending (gate) — flag กลางๆ ข้าม thread ไม่ได้ (review 11-05: bridge thread เขียน / main ล้าง = race)
+        if (!s.titleGate.offer(raw)) return
+        if (!s.titleGate.arm()) return
+        titleHandler.postDelayed({
+            s.titleGate.disarm() // disarm ก่อน flush: offer ที่คาบเกี่ยวต้อง schedule ตัวเองได้ (ไม่งั้น pending ติด)
+            if (s.titleGate.flush()) {
+                refreshTabs()
+                if (s === activePane()) renderActiveStatus()
+            }
+        }, TITLE_DEBOUNCE_MS)
+    }
+
+    // ---------- ticket tmux/05: prefix-pending (client-side buffer — ไม่เคยมี byte ค้างใน PTY) ----------
+
+    /** profile.tmuxKeys = ปิด/เปิดทั้ง bar mode; tmuxPrefix "C-a" = override byte (invalid ที่ form แล้ว = sampai ตรงนี้ไม่ได้) */
+    private fun tmuxPrefixByte(p: Profile?): Byte =
+        TmuxPrefixState.parseSpec(p?.tmuxPrefix) ?: TmuxPrefixState.DEFAULT_PREFIX
+
+    /** push สถานะลง bar — เรียกเมื่อ focus pane เปลี่ยน / pending transition / dial ใหม่ (bar re-compose แถวจาก snapshot นี้) */
+    private fun updateTmuxBar() {
+        if (!this::keysBar.isInitialized) return // timeline ตอน onCreate (กัน callback ก่อน bar เกิด)
+        val p = activePane()?.profile
+        val on = p?.tmuxKeys == true
+        if (!on) {
+            keysBar.setTmux(null)
+            return
+        }
+        val b = tmuxPrefixByte(p)
+        tmuxPrefix.setPrefix(b)
+        keysBar.setTmux(
+            TmuxBarState(
+                prefixLabel = "C-" + ('a' + (b - 1)),
+                armed = tmuxPrefix.isArmed(),
+                onPrefixTap = { onTmuxPrefixTap() },
+                commands = TmuxPreset.quickKeys,
+                onCommand = { q -> onTmuxCommand(q) },
+            )
+        )
+    }
+
+    /** tap = armed (ยังไม่ส่ง byte) / tap ซ้ำขณะ pending = literal `C-b C-b` ≡ tmux semantics */
+    private fun onTmuxPrefixTap() {
+        if (activePane() == null) return
+        if (tmuxPrefix.isArmed()) {
+            routeKey(tmuxPrefix.tapWhileArmed())
+            return
+        }
+        val tok = tmuxPrefix.arm()
+        tmuxHandler.postDelayed({ tmuxPrefix.onTimeout(tok) }, TMUX_PENDING_MS)
+    }
+
+    /** quick-key tap = ขอ prefix จาก state (null = race หลัง timeout — หายเงียบ, ห้ามหลุด byte) */
+    private fun onTmuxCommand(q: TmuxPreset.QuickKey) {
+        val pre = tmuxPrefix.beginCommand() ?: return
+        routeKey(pre + q.afterPrefix)
     }
 
     private fun refreshTabs() {
@@ -1579,7 +1654,8 @@ class MainActivity : ComponentActivity() {
             val states = tab.panes.map { it.controller.state }
             TabInfo(
                 id = id,
-                title = foc?.profile?.tabTitle ?: foc?.profile?.name ?: "new tab",
+                // ticket tmux/04: title ที่ terminal ส่ง (OSC 0/2 ผ่าน gate debounced) ชนะ profile — ≡ desktop terminal
+                title = foc?.titleGate?.title ?: foc?.profile?.tabTitle ?: foc?.profile?.name ?: "new tab",
                 // pill = state รวมทั้ง tab: pane หลัง connect อยู่ก็เห็นเขียว (dot ของ tab ไม่ใช่ของ focused pane)
                 state = when {
                     SessionController.State.CONNECTED in states -> SessionController.State.CONNECTED
@@ -2019,6 +2095,12 @@ class MainActivity : ComponentActivity() {
         val myGen = if (gen >= 0) gen else ++s.dialGen
         if (gen >= 0 && gen != s.dialGen) return // superseded ก่อน countdown จะทันถูก cancel
         s.profile = p
+        // tmux/05 (review fix): dial = connection ใหม่ pending เดิมหมดความหมาย (Q5) — แต่ dial ของ pane
+        // *เบื้องหลัง* (auto-reconnect countdown ของ tab อื่น) ห้ามล้าง pending ของ pane ที่ user เปิดอยู่
+        if (s === activePane()) {
+            tmuxPrefix.disarm()
+            updateTmuxBar() // tmux/05: openTab → showActive วิ่งก่อน profile ถูก set = bar เห็น null → ต้อง refresh ตรงนี้ด้วย (ทุก dial path)
+        }
         s.error = null
         s.fontSize = p.fontSize
         s.fontFace = p.fontFace
@@ -2029,6 +2111,9 @@ class MainActivity : ComponentActivity() {
             if (s.engine == null) {
                 val tv = s.view as TerminalView
                 s.engine = TerminalEngine(tv.gridCols, tv.gridRows, p.historySize).also { tv.attachEngine(it) }
+                // tmux/04: native twin ของ term.onTitleChange — engine มี onOsc มาแต่ round 9, ตรงนี้คือ consumer ตัวแรก
+                // (OSC 0 = icon+title, 2 = title ≡ xterm; code อื่น ignore — gate sanitize+debounce ให้เอง)
+                s.engine?.onOsc = { code, text -> if (code == 0 || code == 2) noteTerminalTitle(s, text) }
                 s.cols = tv.gridCols; s.rows = tv.gridRows
                 s.view.postInvalidate()
             }
@@ -2406,6 +2491,10 @@ class MainActivity : ComponentActivity() {
         val t = text ?: sys ?: lastSetClip?.takeIf { s.controller.activeBackend != null }
             ?: run { toast("Clipboard empty"); return }
         val out = if (settings.trimPaste) t.trimEnd(' ', '\n', '\r') else t
+        // tmux/05 (review fix): paste = block input ไม่ใช่ keystroke → fail-soft: ทิ้ง prefix, pending จบ,
+        // ห้าม prepend (single-char paste ก็คือ paste) — branch native เขียนตรงไม่ผ่าน transform ใด ๆ
+        // (ฝั่ง webview มี guard ซ้ำที่ onInput src=paste แล้ว — JS round-trip แล่นทีหลัง disarm ตรงนี้)
+        tmuxPrefix.disarm()
         if (s.native) {
             // bracketed paste รับผิดชอบที่ input path (xterm ทำใน JS paste handler) — engine มี mode แล้ว
             val wrap = s.engine?.modes?.bracketedPaste == true
@@ -2542,6 +2631,8 @@ class MainActivity : ComponentActivity() {
         flushSnapshotNow() // T4: graceful kill (back/swipe) = เก็บ snapshot รุ่นล่าสุดก่อนตาย
         settingsWatcher?.stop()
         settingsWatcher = null
+        titleHandler.removeCallbacksAndMessages(null) // tmux/04: pending title flush ห้ามรันหลัง destroy (refreshTabs เขียน Compose state)
+        tmuxHandler.removeCallbacksAndMessages(null) // tmux/05: pending timeout ก็ likewise
         KeyPopup.dismiss() // fix wave B1: static open-popup survives Activity death — no-op when nothing is open
         clipListener?.let { clipboard().removePrimaryClipChangedListener(it) } // M2.2
         clipListener = null
@@ -2669,7 +2760,11 @@ class MainActivity : ComponentActivity() {
             if (text.length > 1 && src == ImeAutocomplete.SRC_IME && ImeAutocomplete.plausibleImeText(text)) {
                 noteImeAutocomplete(ImeAutocomplete.Kind.BURST, text, composing) // HW 11-05
             }
-            val r = mods.transform(text) // round 21: transform ก่อน write = Gboard تحت CTRL/⇧ ให้ผลเหมือน bar
+            // round 21: transform ก่อน write = Gboard تحت CTRL/⇧ ให้ผลเหมือน bar (tmux/05: pending ครอบชั้นนอก)
+            // review fix: ก้อน src=paste (Aterm.paste ติดป้าย) = block input → disarm ทิ้ง prefix เสมอ
+            // (JS round-trip แล่นหลัง disarm ที่ pasteNow แล้ว — กันเค้าวาง pending *ระหว่าง* แล่น: ESC[200~ ห้ามโดน prepend)
+            val m = mods.transform(text)
+            val r = if (src == ImeAutocomplete.SRC_PASTE) { tmuxPrefix.disarm(); m } else tmuxPrefix.transform(m)
             lruTouch(session()); session().controller.write(r)
         }
 
@@ -2691,7 +2786,9 @@ class MainActivity : ComponentActivity() {
         // แล้ว latch ยังโดนกินอีก (วัดจริงบน emulator 2026-11-04)
         fun onFlush(text: String) {
             if (text.isEmpty()) return
-            lruTouch(session()); session().controller.write(text)
+            // tmux/05 (review fix): flush = ตัวอักษรที่ user พิมพ์จริง (preedit ค้างก่อน modifier กด)
+            // = funnel หนึ่งตาม Q3 → pending ต้องครอบ (single-char flush = command key) — mods ยังข้ามตาม round 21
+            lruTouch(session()); session().controller.write(tmuxPrefix.transform(text))
         }
 
         @JavascriptInterface
@@ -2715,6 +2812,15 @@ class MainActivity : ComponentActivity() {
                 refreshTabs()
                 if (s === activePane()) renderActiveStatus()
             }
+        }
+
+        /**
+         * ticket tmux/04: terminal.html hook `term.onTitleChange` (OSC 0/2) — debounce ต่อ pane
+         * ผ่าน noteTerminalTitle (untrusted: sanitize/cap อยู่ที่ gate ไม่ใช่ JS)
+         */
+        @JavascriptInterface
+        fun onTerminalTitle(title: String) {
+            noteTerminalTitle(session(), title)
         }
 
         @JavascriptInterface
@@ -2774,8 +2880,9 @@ class MainActivity : ComponentActivity() {
      * system clip โดนล้างทันทีหลังเรา set (ตรวจพบ round 3: copy แล้ว clip หายทั้งก้อน)
      * — re-arm เฉพาะเมื่อ clip กลายเป็นว่าง (ว่าง = ระบบล้าง; ถ้ามี text อื่น = user copy จาก app อื่น ห้ามทับ)
      */
-    /** clipboard entry เดียวกันของสอง path: JS bridge (webview) + TerminalView.onCopy (native, T2) */
-    private fun copyTextToClipboard(text: String) {
+    /** clipboard entry เดียวกันของสอง path: JS bridge (webview) + TerminalView.onCopy (native, T2)
+     *  internal = tmux/04 preset dialog (ConnectUi) ใช้ entry เดียวกัน — กัน clip-denial re-arm หายไปตาม path */
+    internal fun copyTextToClipboard(text: String) {
         lastCopiedByApp = text
         lastSetClip = text
         runOnUiThread { armClipboard(text) }
@@ -2807,6 +2914,8 @@ class MainActivity : ComponentActivity() {
         private const val PREF_IME_HINT = "imeHintShownFor" // HW 11-05: จำ IME ที่ถูกพาไปตั้งค่าแล้ว
         private const val PANE_FOCUS = 0xFF3DA0FF.toInt()   // กรอบ focused pane (accent เดียวกับ theme)
         private const val CRASH_LOOP_WINDOW_MS = 15_000L    // T4: boot ใหม่ไวเกินไปหลัง restore attempt = ข้าม restore ครั้งเดียว
+        private const val TITLE_DEBOUNCE_MS = 500L          // tmux/04: trailing window ของ OSC title → pill
+        private const val TMUX_PENDING_MS = 5_000L          // tmux/05: timeout ของ prefix-pending (Q5 — client-side cancel เท่านั้น)
     }
 }
 
@@ -2880,4 +2989,14 @@ private class ImeGateWebView(context: android.content.Context) : WebView(context
             context.getSystemService(android.view.inputmethod.InputMethodManager::class.java)?.restartInput(this)
         }
     }
+}
+
+/** true = view นี้อยู่ใต้ WebView ของ terminal (รวม surrogate EditText ที่ Chromium สร้างถือ IC — tmux/05 fix) */
+private fun android.view.View.hostedInTerminalWebView(): Boolean {
+    var v: android.view.View? = this
+    while (v != null) {
+        if (v is ImeGateWebView) return true
+        v = v.parent as? android.view.View
+    }
+    return false
 }

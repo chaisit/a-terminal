@@ -87,8 +87,20 @@ class SshBackend(
 
     private var client: SshClient? = null
     private var session: ClientSession? = null
-    private var shell: ChannelShell? = null
+    // tmux/01: parent ของ ChannelShell และ ChannelExec (javap 2.14.0) — commandline set = exec channel ตัวเดียวกันนี้
+    private var shell: org.apache.sshd.client.channel.PtyCapableChannelSession? = null
     private val closed = AtomicBoolean(false)
+
+    /**
+     * tmux/02: ผล probe ต่อ connection (exec `tmux -V`) — null = ยังไม่เสร็จ / ไม่มี tmux / probe พัง
+     * **per-connection เสมอ (ห้าม persist)**: redial = probe ใหม่, version เปลี่ยน feature gate ตามจริง
+     */
+    @Volatile
+    override var tmuxCapabilities: dev.aterminal.core.TmuxCapabilities? = null
+        private set
+
+    // review tmux/02: epoch guard — probe เก่า (connection ก่อน redial) ห้ามเขียนทับผลของ connection ใหม่
+    private val probeGeneration = java.util.concurrent.atomic.AtomicLong(0)
 
     private fun diag(msg: String) {
         diagnostics?.let { runCatching { it(msg) } }
@@ -205,6 +217,10 @@ class SshBackend(
     @Volatile private var verifierFailure: Throwable? = null
 
     override suspend fun connect(startup: StartupArgs) = withContext(Dispatchers.IO) {
+        // review tmux/02: redial บน instance เดียว = connection ใหม่เสมอ — ค่าเก่าต้องหายทันที (gate ห้ามอ่าน version เก่า)
+        // และ bump generation ให้ probe ของ connection เดิมเขียนไม่เข้า
+        tmuxCapabilities = null
+        val probeGen = probeGeneration.incrementAndGet()
         val c = SshClient.setUpDefaultClient()
         // ไม่ใช้ heartbeat ในตัวของ MINA (HEARTBEAT_INTERVAL) เพราะ scheduleAtFixedRate ยิงรอบที่ค้างรวดเดียวหลัง process ถูกหยุด
         // แล้วตัด session ทั้งที่ network ดี (พบจริงบน Honor: หยุด 37 วินาทีตอนอยู่ background) ดู startKeepalive
@@ -255,17 +271,37 @@ class SshBackend(
                 ptyColumns = startup.cols
                 ptyLines = startup.rows
             }
-            val sh = s.createShellChannel(pty, mapOf("TERM" to "xterm-256color") + startup.env)
+            // tmux/01 (WT profile.commandline): set = exec request แทน default shell — ≡ `ssh host <cmd>`
+            // (javap 2.14.0: createExecChannel(String, PtyChannelConfigurationHolder, Map) — PTY+env ครบเหมือน shell)
+            val sessionEnv = mapOf("TERM" to "xterm-256color") + startup.env // เดียวกันทั้งสอง path (ticket 02+ จะเพิ่ม env)
+            val cmd = startup.commandline?.takeIf { it.isNotBlank() }
+            val sh = cmd?.let {
+                s.createExecChannel(it, pty, sessionEnv).apply {
+                    // FACT (javap -c 2.14.0): constructor ของ ChannelExec ยัด usePty=false เข้า parent
+                    // แม้จะส่ง PtyChannelConfiguration ให้ — ไม่ setTrue = doOpenPty เงียบ = exec ไม่มี PTY
+                    // (tmux on a non-tty exec = "open terminal failed"; probe pty-req บน lab ยืนยัน)
+                    setUsePty(true)
+                }
+            } ?: s.createShellChannel(pty, sessionEnv)
             // R4: async + merge stderr ต้อง set "ก่อน open()" (doOpen สร้าง asyncOut ตาม streaming — sources: ChannelSession)
             // บทเรียน device-gate R10: streaming=Async ทำให้ `setIn(pipe)` ไม่มีคน pull = input ตายเงียบ (เจอจริงบน lab)
             // ⇒ ขา app→server ต้องไป asyncIn.writeBuffer เท่านั้น (javap: IoOutputStream.writeBuffer(Buffer):IoWriteFuture)
             sh.streaming = StreamingChannel.Streaming.Async
             sh.isRedirectErrorStream = true // stderr = stream เดียวตามพฤติกรรม terminal
-            sh.open().verify(TIMEOUT)
+            try {
+                sh.open().verify(TIMEOUT)
+            } catch (e: Exception) {
+                // review tmux/01: exec/pty request ที่ server ปฏิเสธถาวร (forced-command, PermitTTY no) = CHANNEL_FAILED
+                // — อย่าปล่อยให้ตก generic catch แล้วแปลงเป็น UNREACHABLE ซึ่งสื่อ "ลองใหม่แล้วจะผ่าน"
+                closeQuietly()
+                throw BackendError(BackendError.Code.CHANNEL_FAILED,
+                    "channel open rejected by $host:$port" + (cmd?.let { " (commandline exec)" } ?: ""), e)
+            }
             shell = sh
             startKeepalive(c, s)
             startPump(sh.asyncOut)
             startStdinWriter() // R4-fix2: ขา app→server แบบ serialized (single outstanding writeBuffer)
+            probeTmux(s, probeGen) // tmux/02: async daemon — dial ไม่ช้าลง, result เข้า tmuxCapabilities (fail-soft, epoch-guarded)
 
             sh.addCloseFutureListener {
                 if (closed.compareAndSet(false, true)) {
@@ -277,8 +313,14 @@ class SshBackend(
                     keepalive?.cancel(false)
                     val exit = runCatching { sh.exitStatus }.getOrNull()
                     diag("channel closed exit=$exit")
-                    onClosed(if (exit != null) CloseReason.Normal
-                    else CloseReason.Error("ssh channel closed", retryable = true))
+                    // review tmux/01: exec ทำให้ exit ≠ 0 เป็นเรื่องปกติ (command typo = 127, tmux lost server = 1)
+                    // — map เป็น Error(non-retryable) เพื่อไม่ให้ pane ตายเงียบ และ redial ไม่วนรันคำสั่งพังซ้ำ
+                    // (exit 0 = user พิมพ์ exit / tmux detach → Normal ตาม T3 เดิม; shell path ไม่เปลี่ยนพฤติกรรม)
+                    onClosed(when {
+                        exit == null -> CloseReason.Error("ssh channel closed", retryable = true)
+                        cmd != null && exit != 0 -> CloseReason.Error("remote command exited ($exit)", retryable = false)
+                        else -> CloseReason.Normal
+                    })
                 }
             }
         } catch (e: BackendError) {
@@ -332,6 +374,11 @@ class SshBackend(
     /** fingerprint แบบ `ssh-keygen -lf` (SHA256 base64 no-padding) — ให้ TOFU UI ใช้ */
     companion object {
         internal val TIMEOUT = Duration.ofSeconds(20)
+        // tmux/02: probe — string ตรงกับที่ TestSshServer.PROBE_COMMAND assert; read deadline สั้น (output = 1 บรรทัด)
+        internal const val TMUX_PROBE_COMMAND = "tmux -V"
+        private const val PROBE_READ_TIMEOUT_MS = 3_000L
+        // output จริง = 1 บรรทัด (< 20 B); เกินนี้ = server แปลก/ป้อนขยะ — fail-soft ก่อน memory bomb (review tmux/02)
+        private const val PROBE_MAX_BYTES = 4_096
         private val PROBE_KEX_TIMEOUT = Duration.ofSeconds(10)
 
         internal const val DIAG_MAX_MESSAGE = 160
@@ -468,6 +515,59 @@ class SshBackend(
         // (บทเรียน: pump/stdinWriter อยู่ off-main เสมอ — resize คือ path เดียวที่เผลอ run บน main)
         val sh = shell ?: return
         resizeExec.execute { runCatching { sh.sendWindowChange(cols, rows) } }
+    }
+
+    /**
+     * tmux/02: one-shot probe ต่อ connection — exec channel ที่สอง **ไม่มี PTY** (`tmux -V` ไม่ต้องใช้ tty)
+     *
+     * - FACT (javap 2.14.0): `createExecChannel(String)` = ctor เดิมที่ usePty=false — คดีกลับด้านจาก tmux/01:
+     *   ตรงนี้เรา *ต้องการ* false จึงไม่ setUsePty (test assert ว่า pty-req มีแค่ของ channel หลัก)
+     * - redirect stderr = signal: "command not found" มาทาง stderr และ parser fail-soft เป็น null อยู่แล้ว
+     * - read แบบ poll available() ไม่ใช่ blocking read: deadline ตัดได้จริง (forced-command server ที่
+     *   exec ไม่ exit ต้องไม่ค้าง thread/channel) — ผล = null, session หลักไม่สะเทือน
+     * - output เป็น server-controlled 100% (stderr รวมมาด้วย): cap ปริมาณก่อน parse — mem-bomb กันMITM sshd
+     * - write ทุกทางผ่าน generation guard: probe ของ connection เก่า (redial/instance reuse) ห้ามแตะค่าของใหม่;
+     *   daemon thread ที่ยังไม่จบจึง harmless — close() ปิด session → poll loop เห็น !isOpen แล้วจบเอง
+     * - ทุก failure path = null + diag, ไม่ throw ไม่ปิด connection (probe เป็น passenger ไม่ใช่ driver)
+     */
+    private fun probeTmux(s: ClientSession, gen: Long) {
+        Thread {
+            var ch: org.apache.sshd.client.channel.ChannelExec? = null
+            try {
+                ch = s.createExecChannel(TMUX_PROBE_COMMAND)
+                ch.isRedirectErrorStream = true
+                ch.open().verify(TIMEOUT)
+                val out = java.io.ByteArrayOutputStream()
+                val buf = ByteArray(256)
+                val deadline = System.currentTimeMillis() + PROBE_READ_TIMEOUT_MS
+                while (System.currentTimeMillis() < deadline) {
+                    val avail = ch.invertedOut.available()
+                    if (avail > 0) {
+                        val n = ch.invertedOut.read(buf, 0, minOf(avail, buf.size))
+                        if (n <= 0) break
+                        out.write(buf, 0, n)
+                        if (out.size() >= PROBE_MAX_BYTES) break // output ยาวผิดปกติ = ไม่ใช่ version line — fail-soft
+                    } else if (!ch.isOpen) {
+                        break // ปิดเงียบ ๆ โดยไม่มี output = fail-soft
+                    } else {
+                        Thread.sleep(25)
+                    }
+                }
+                val caps = dev.aterminal.core.TmuxVersion.parse(out.toString(Charsets.UTF_8)) // decode ครั้งเดียว (review: chunk ข้าม byte ไม่ได้)
+                    ?.let { dev.aterminal.core.TmuxCapabilities(it) }
+                if (probeGeneration.get() == gen) { // connection ยังปัจจุบันเท่านั้นจึงรับผล
+                    tmuxCapabilities = caps
+                    diag("tmux probe -> ${caps?.version ?: "none"}")
+                }
+            } catch (t: Throwable) {
+                if (probeGeneration.get() == gen) { // exec ถูกปฏิเสธ/timeout = ไม่มี feature, ไม่ใช่ connection fail — ห้าม clobber ค่าของ connection ใหม่
+                    tmuxCapabilities = null
+                    diag("tmux probe failed ${describe(t)}")
+                }
+            } finally {
+                runCatching { ch?.close(false) }
+            }
+        }.apply { isDaemon = true; name = "aterm-tmux-probe"; start() }
     }
 
     override fun close() {

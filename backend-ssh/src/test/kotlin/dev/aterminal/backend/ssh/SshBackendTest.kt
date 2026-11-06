@@ -5,6 +5,7 @@ import dev.aterminal.core.StartupArgs
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Assume.assumeTrue
@@ -22,6 +23,8 @@ class SshBackendTest {
     private lateinit var server: org.apache.sshd.server.SshServer
     private val out = LinkedBlockingQueue<ByteArray>()
     private var backend: SshBackend? = null
+    // review tmux/01: close-reason contract tests
+    @Volatile private var closedReason: dev.aterminal.core.CloseReason? = null
 
     @Before fun setUp() { server = TestSshServer.start(); out.clear() }
 
@@ -41,6 +44,7 @@ class SshBackendTest {
         diagnostics = diagnostics,
     ).also { b ->
         b.onData = { out.put(it) }
+        b.onClosed = { closedReason = it }
         backend = b
     }
 
@@ -63,6 +67,177 @@ class SshBackendTest {
         b.write("ping\r".toByteArray())
         val echoed = drain()
         assertTrue("echo missing: [$echoed]", echoed.contains("ping"))
+    }
+
+    // ── tmux/01: startup.commandline = exec request แทน default shell (WT profile.commandline)
+
+    @Test fun `commandline runs as exec with pty instead of shell`() {
+        val b = newBackend()
+        runBlocking {
+            b.connect(StartupArgs(commandline = "tmux new -A -s aterm", startingDirectory = null, cols = 30, rows = 8))
+        }
+        val banner = drain()
+        assertTrue("exec channel did not start (no banner): [$banner]", banner.contains("TESTBANNER"))
+        assertTrue("exec command not received: ${TestSshServer.recordedCommands}",
+            TestSshServer.recordedCommands.contains("tmux new -A -s aterm"))
+        // PTY must be negotiated at open with the requested size (tmux reads it via TIOCGWINSZ)
+        val deadline = System.currentTimeMillis() + 3000
+        while (System.currentTimeMillis() < deadline &&
+            TestSshServer.recordedPtyReqs.none { it == 30 to 8 }
+        ) Thread.sleep(50)
+        assertTrue("pty-req 30x8 not seen on exec channel: ${TestSshServer.recordedPtyReqs}",
+            TestSshServer.recordedPtyReqs.contains(30 to 8))
+        b.write("ping\r".toByteArray())
+        val echoed = drain()
+        assertTrue("echo missing: [$echoed]", echoed.contains("ping"))
+    }
+
+    @Test fun `blank commandline keeps shell path with no exec request`() {
+        val b = newBackend()
+        runBlocking { b.connect(StartupArgs(commandline = "   ", startingDirectory = null, cols = 80, rows = 24)) }
+        val banner = drain()
+        assertTrue("shell banner missing: [$banner]", banner.contains("TESTBANNER 80x24"))
+        // ticket tmux/02 เปลี่ยน invariant: shell path = ไม่มี exec ของ *ผู้ใช้* (probe "tmux -V" ยิงทุก connection — แยก assert)
+        assertTrue("blank commandline ต้องไม่ยิง exec: ${TestSshServer.recordedCommands}",
+            TestSshServer.recordedCommands.filterNot { it == TestSshServer.PROBE_COMMAND }.isEmpty())
+    }
+
+    private fun awaitClose(timeoutMs: Long = 5000): dev.aterminal.core.CloseReason? {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline && closedReason == null) Thread.sleep(50)
+        return closedReason
+    }
+
+    @Test fun `exec non-zero exit is Error non-retryable, not silent Normal`() {
+        val b = newBackend()
+        runBlocking { b.connect(StartupArgs(commandline = "tmux new -A -s x", startingDirectory = null, cols = 80, rows = 24)) }
+        drain(1500)
+        b.write("fail\r".toByteArray())
+        val reason = awaitClose()
+        assertTrue("exec exit=3 ต้อง not Normal: $reason", reason is dev.aterminal.core.CloseReason.Error)
+        assertTrue("exit-code failure ต้องไม่ redial วน: $reason",
+            !(reason as dev.aterminal.core.CloseReason.Error).retryable)
+        assertTrue("reason ต้องบอก exit code: ${reason.message}", reason.message.contains("3"))
+    }
+
+    @Test fun `exec clean exit stays Normal (detach path unchanged)`() {
+        val b = newBackend()
+        runBlocking { b.connect(StartupArgs(commandline = "tmux new -A -s x", startingDirectory = null, cols = 80, rows = 24)) }
+        drain(1500)
+        b.write("exit\r".toByteArray())
+        val reason = awaitClose()
+        org.junit.Assert.assertEquals(dev.aterminal.core.CloseReason.Normal, reason)
+    }
+
+    @Test fun `shell non-zero exit keeps legacy Normal (no behavior change)`() {
+        val b = newBackend()
+        runBlocking { b.connect(StartupArgs(commandline = null, startingDirectory = null, cols = 80, rows = 24)) }
+        drain(1500)
+        b.write("fail\r".toByteArray())
+        val reason = awaitClose()
+        org.junit.Assert.assertEquals(dev.aterminal.core.CloseReason.Normal, reason)
+    }
+
+    @Test fun `unset commandline keeps shell path with no exec request`() {
+        val b = newBackend()
+        runBlocking { b.connect(StartupArgs(commandline = null, startingDirectory = null, cols = 80, rows = 24)) }
+        drain(1500) // banner
+        // ticket tmux/02: probe "tmux -V" คือ exec เดียวที่ shell path แตะ commandFactory ได้
+        assertTrue("shell path ต้องไม่แตะ commandFactory ด้วยคำสั่งผู้ใช้: ${TestSshServer.recordedCommands}",
+            TestSshServer.recordedCommands.filterNot { it == TestSshServer.PROBE_COMMAND }.isEmpty())
+    }
+
+    // ── tmux/02: probe ต่อ connection (exec `tmux -V` ไม่มี PTY, fail-soft, เก็บไม่ persist)
+
+    private fun awaitCaps(b: SshBackend, timeoutMs: Long = 4000): dev.aterminal.core.TmuxCapabilities? {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline && b.tmuxCapabilities == null) Thread.sleep(50)
+        return b.tmuxCapabilities
+    }
+
+    @Test fun `probe exposes capability table from canned tmux version`() {
+        TestSshServer.versionOutput = "tmux 3.2a"
+        val b = newBackend()
+        runBlocking { b.connect(StartupArgs(commandline = null, startingDirectory = null, cols = 80, rows = 24)) }
+        assertTrue("banner missing", drain().contains("TESTBANNER 80x24"))
+        val caps = awaitCaps(b)
+        org.junit.Assert.assertNotNull("probe ไม่ได้ version — probe exec ที่เห็น: ${TestSshServer.recordedCommands}", caps)
+        org.junit.Assert.assertEquals(dev.aterminal.core.TmuxVersion(3, 2, 'a'), caps!!.version)
+        // gate smoke (ตารางจริง test อยู่ฝั่ง terminal-core — ที่นี่ proof ว่า probe ต่อตารางถูกตัว)
+        assertTrue("3.2a ต้องมี client-detached notify", caps.clientDetachedNotify)
+        assertTrue("3.2a ต้องมี osc52", caps.osc52Clipboard)
+        assertFalse("3.2a ยังไม่มี layout JSON", caps.layoutJson)
+        assertTrue("probe ต้องส่ง exec tmux -V: ${TestSshServer.recordedCommands}",
+            TestSshServer.recordedCommands.contains(TestSshServer.PROBE_COMMAND))
+    }
+
+    @Test fun `probe uses a second exec channel without pty-req`() {
+        TestSshServer.versionOutput = "tmux 3.6"
+        val b = newBackend()
+        runBlocking { b.connect(StartupArgs(commandline = null, startingDirectory = null, cols = 80, rows = 24)) }
+        awaitCaps(b)
+        // channel หลัก (shell) = pty-req เดียว — probe ห้ามขอ PTY (exec ธรรมดา, output เล็ก)
+        org.junit.Assert.assertEquals("probe ห้ามสร้าง PTY: ${TestSshServer.recordedPtyReqs}",
+            listOf(80 to 24), TestSshServer.recordedPtyReqs.toList())
+    }
+
+    @Test fun `probe fail-soft no tmux output leaves caps null and session healthy`() {
+        TestSshServer.versionOutput = "bash: line 1: tmux: command not found"
+        val b = newBackend()
+        runBlocking { b.connect(StartupArgs(commandline = null, startingDirectory = null, cols = 80, rows = 24)) }
+        assertTrue("banner missing", drain().contains("TESTBANNER"))
+        val deadline = System.currentTimeMillis() + 3000
+        while (System.currentTimeMillis() < deadline &&
+            !TestSshServer.recordedCommands.contains(TestSshServer.PROBE_COMMAND)
+        ) Thread.sleep(50)
+        Thread.sleep(300) // canned exit(0) ถึง client แล้ว — parse ต้องจบ (null), ไม่ throw
+        org.junit.Assert.assertNull("output garbage ต้องเป็น null (fail-soft)", b.tmuxCapabilities)
+        // session หลักต้องไม่สะเทือน
+        b.write("ping\r".toByteArray())
+        assertTrue("echo after failed probe missing", drain().contains("ping"))
+    }
+
+    @Test fun `probe coexists with commandline exec path`() {
+        TestSshServer.versionOutput = "tmux 3.6"
+        val b = newBackend()
+        runBlocking {
+            b.connect(StartupArgs(commandline = "tmux new -A -s x", startingDirectory = null, cols = 80, rows = 24))
+        }
+        assertTrue("banner missing", drain().contains("TESTBANNER"))
+        val caps = awaitCaps(b)
+        org.junit.Assert.assertNotNull("probe fails เมื่อ main เป็น exec: ${TestSshServer.recordedCommands}", caps)
+        assertTrue("3.6 ต้องมี osc forwarding", caps!!.oscForwarding)
+        assertFalse("3.6 ยังไม่มี layout JSON", caps.layoutJson)
+        assertTrue("both execs ต้องถึง server: ${TestSshServer.recordedCommands}",
+            TestSshServer.recordedCommands.containsAll(listOf("tmux new -A -s x", TestSshServer.PROBE_COMMAND)))
+        // pty-req ต้องมีเฉพาะ channel หลัก (exec ผู้ใช้) — probe ไม่ขอ PTY
+        org.junit.Assert.assertEquals(listOf(80 to 24), TestSshServer.recordedPtyReqs.toList())
+    }
+
+    @Test fun `redial clears stale capabilities before the new probe resolves`() {
+        // review tmux/02: gate ห้ามอ่าน version ของ connection เก่าตอน redial (instance reuse)
+        TestSshServer.versionOutput = "tmux 3.6"
+        val b = newBackend()
+        runBlocking { b.connect(StartupArgs(commandline = null, startingDirectory = null, cols = 80, rows = 24)) }
+        org.junit.Assert.assertNotNull(awaitCaps(b))
+        // redial บน instance เดียว: round-2 ที่ probe ยังไม่เสร็จ (versionOutput=null → exec ไม่ exit, deadline 3วิ)
+        // ค่าเดิมต้องเป็น null ทันทีที่ connect() คืน — determinism: ไม่มีทางที่ probe ใหม่เขียนเข้าก่อน assert
+        TestSshServer.versionOutput = null
+        runBlocking { b.connect(StartupArgs(commandline = null, startingDirectory = null, cols = 80, rows = 24)) }
+        org.junit.Assert.assertNull("caps เก่าค้างหลัง redial", b.tmuxCapabilities)
+    }
+
+    @Test fun `probe bounds server-controlled output (flood cannot balloon the buffer)`() {
+        // review tmux/02: output ผ่าน probe = untrusted 100% — cap 4KiB แล้ว fail-soft (mem-bomb กันMITM sshd)
+        TestSshServer.versionOutput = "x".repeat(1_000_000)
+        val lines = java.util.concurrent.CopyOnWriteArrayList<String>()
+        val b = newBackend(diagnostics = { lines.add(it) })
+        runBlocking { b.connect(StartupArgs(commandline = null, startingDirectory = null, cols = 80, rows = 24)) }
+        assertTrue("banner missing", drain().contains("TESTBANNER"))
+        val deadline = System.currentTimeMillis() + 6000
+        while (System.currentTimeMillis() < deadline && lines.none { it.startsWith("tmux probe") }) Thread.sleep(50)
+        assertTrue("probe ต้องจบด้วย none (cap cut) ไม่ใช่ค้าง: $lines", lines.any { it == "tmux probe -> none" })
+        org.junit.Assert.assertNull("outputขยะทั้งก้อนต้อง null", b.tmuxCapabilities)
     }
 
     @Test fun `probeHostKey returns key without auth (TOFU two-phase UI flow)`() {

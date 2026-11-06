@@ -42,8 +42,8 @@ android {
         // (crash on one device), and runs drawn with a fallback font needed per-cell anchoring to stay aligned
         // 0.5.6–0.5.10 (code 25–29): keyboard suggestions — settings.imeSuggestions (default now strict),
         // ⌨️ toggle + Keyboard settings… in the ⋮ menu, and a one-time hint per keyboard when it ignores the flag
-        versionCode = 29
-        versionName = "0.5.10"
+        versionCode = 31
+        versionName = "0.5.12"
     }
 
     signingConfigs {

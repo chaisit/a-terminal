@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.5.12
+
+Everything that landed since 0.5.10 ships here: a tmux interop set. The 0.5.11 build in between was
+tested on real devices but was never published.
+
+### tmux
+
+- **Your session survives the connection.** A profile can now run a command instead of the plain
+  login shell: put `tmux new -A -s main` in the new **Command** field and every redial — after a
+  dropped network, a closed app, a flight — rejoins the same tmux session instead of starting over.
+  Detaching inside tmux ends the connection as a clean exit, not an error.
+- **A setup snippet you copy, never auto-applied.** The session editor's **📋 tmux setup…** button
+  shows a short `.tmux.conf` snippet (window titles on, mouse on) with a copy button. The app never
+  writes to your server's config; you paste it where you want it.
+- **Tab titles follow your tmux windows.** When tmux (or any program) sets the terminal title with
+  OSC 0/2, the tab pill renames itself to match — with a debounce, so fast window switching does
+  not flicker the strip.
+- **tmux keys mode.** Check **📟 tmux keys** on a profile and the keys bar grows a **prefix**
+  button: tap it (the tmux prefix — `C-b`, or any `C-x` you set in the profile, e.g. `C-a`), then
+  tap a key from the quick-keys row that replaces the bar: `% c d z n p w x [ s ,` and arrows —
+  split, new window, detach, zoom, window nav, copy-mode, choose-tree, rename, pane selection. On
+  narrow screens the row keeps the first keys visible and folds the rest behind **⋯**. Nothing is
+  sent until the second tap; any other input, paste, or a 5-second timeout cancels cleanly.
+- The app probes the server's tmux version once per connection and quietly keeps version-gated
+  features off when the server is too old — nothing to configure.
+
 ## 0.5.10
 
 Everything that landed since 0.5.2 ships here. The builds in between were tested on real devices but

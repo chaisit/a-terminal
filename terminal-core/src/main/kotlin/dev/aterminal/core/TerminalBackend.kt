@@ -28,6 +28,13 @@ interface TerminalBackend {
     /** output จาก shell (VT byte stream) — deliver on caller-chosen dispatcher */
     var onData: (ByteArray) -> Unit
     var onClosed: (reason: CloseReason) -> Unit
+
+    /**
+     * tmux/02 (central API ของ feature gates): version+capabilities ของ tmux ฝั่ง remote
+     * probe หนึ่งครั้งต่อ connection (exec `tmux -V`) — **ห้าม persist** (tmux เปลี่ยน version ได้, pin ผิด = feature พังเงียบ)
+     * null = ยัง probe ไม่เสร็จ / ไม่มี tmux / backend นี้ไม่ probe (echo) — ผู้เรียกต้อง fail-soft (ซ่อน feature)
+     */
+    val tmuxCapabilities: TmuxCapabilities? get() = null
 }
 
 /** สิ่งที่ profile ต้องส่งให้ backend ตอนเปิด session (mapping ของ WT NewTerminalArgs) */

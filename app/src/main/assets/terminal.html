@@ -197,6 +197,8 @@ term.onData(data => {
 // R4 mouse: report แบบ X10/VT200 ที่ไม่ขอ 1006 ออกทาง onBinary (latin1, coord >127 จะพังผ่าน String bridge)
 // — ส่ง base64 ไป decode ฝั่ง Kotlin; SGR (1006 = tmux/htop) วิ่ง onData เองแล้ว
 term.onBinary(s => { if (window.Droid && Droid.onBinaryBytes) Droid.onBinaryBytes(btoa(s)); });
+// tmux/04: OSC 0/2 (tmux set-titles) → tab pill — Kotlin sanitize+debounce เอง, JS ส่งดิบทุกค่า
+term.onTitleChange(t => { if (window.Droid && Droid.onTerminalTitle) Droid.onTerminalTitle(t); });
 
 // round 21: modifier flush (ฝั่ง JS ของ native preemptComposition) — Gboard ส่งตัวอักษรเข้า
 // composing region แล้วนั่งรอ commit ตรงนั้น (วัดจริง: tap 'j' สองครั้งติด = onData 'jj' ก้อนเดียว

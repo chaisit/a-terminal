@@ -72,6 +72,9 @@ class ExtraKeysBar(
     // task 9: สีจาก scheme ของ pane active (null = ยังไม่ถูกทา → styling default ของ platform)
     private var chrome: ChromeColors? = null
     private var imeUp = false // ⌨ highlight ต้องไม่โดน chrome ทาทับตอน IME เปิด
+    // ticket tmux/05: tmux mode — null = profile ไม่เปิด (bar = preset ล้วนเหมือนเดิมทุกตัวอักษร)
+    private var tmux: TmuxBarState? = null
+    private var tmuxBtns: List<BodyItem> = emptyList()
 
     init {
         orientation = HORIZONTAL
@@ -103,6 +106,7 @@ class ExtraKeysBar(
             }
         }
 
+        // buildRow ไล่ keyButtons/modifierButtons ทิ้งแล้ว re-add — ปุ่ม tmux ก็ต้องถูกสร้างใหม่ (sync กับ chrome)
         buildRow()
 
         // fire() อาจถูกเรียกจาก JavaBridge thread (Droid.onInput → transform) — setText จากนอก main
@@ -172,6 +176,56 @@ class ExtraKeysBar(
         refreshModifiers()
     }
 
+    /**
+     * ticket tmux/05: สถานะ tmux ของ pane active — host เรียกเมื่อ focus pane / pending เปลี่ยน / preset reload
+     *  - null = ปิด mode (preset เดิมทุกตัวอักษร — profile ไม่เปิด tmuxKeys หรือ echo)
+     *  - armed = Q2 (user อนุมัติ): **swap เนื้อ row ทั้งแถว** = prefix✓ + quick-keys, preset ซ่อนชั่วคราว —
+     *    ความสูง bar ไม่ขยับ = ไม่มีปัญหา IME rows (gotcha native-render-gap); restore ทันทีที่ pending จบ
+     *  - not armed = ปุ่ม prefix (label "C-b" ฯลฯ) นำหน้า preset — fold/fit math คิดตามจำนวนปุ่มจริง
+     */
+    fun setTmux(state: TmuxBarState?) {
+        // fix tmux/05 (E2E 11-05): host เรียกซ้ำถี่ตอน connect/restore (showActive ทุก state change — วัดได้ 9× ใน 1s) —
+        // เนื้อ row เดิม = ห้ามรื้อปุ่มทิ้งแล้วสร้างใหม่ (view สลับกลาง gesture = press ที่กำลังกดหลุด + churn ทั้งแถบ)
+        // callbacks มาจาก lambda บน singleton เดียวกันทุกครั้ง = เทียบเฉพาะ observable content
+        val same = (state == null && tmux == null) ||
+            (state != null && tmux != null &&
+                state.armed == tmux!!.armed && state.prefixLabel == tmux!!.prefixLabel)
+        if (same) return
+        tmux = state
+        tmuxBtns = buildTmuxBtns()
+        applyFold(0)
+        applyChromeToButtons()
+        row.post { relayoutBody() }
+    }
+
+    private fun buildTmuxBtns(): List<BodyItem> {
+        // setTmux เรียกซ้ำได้บ่อย (ทุก pending transition) — ต้องถอดปุ่มเก่าออกจาก pool ก่อน สร้างใหม่ (กัน pool บวม)
+        for (old in tmuxBtns) keyButtons.removeAll { it.first === old.view }
+        val st = tmux ?: return emptyList()
+        val prefix = synthBtn(if (st.armed) "${st.prefixLabel}✓" else st.prefixLabel) { st.onPrefixTap() }
+        return if (!st.armed) listOf(prefix)
+        else listOf(prefix) + st.commands.map { q -> synthBtn(q.label) { st.onCommand(q) } }
+    }
+
+    /** แถวที่ *แสดง* จริง = preset + tmux prefix (not armed) หรือ prefix✓+quick-keys (armed) */
+    private fun shownItems(): List<BodyItem> {
+        val st = tmux ?: return bodyItems
+        return if (st.armed) tmuxBtns else tmuxBtns + bodyItems
+    }
+
+    /** ปุ่มสังเคราะห์สไตล์เดียวกับ keyBtn (monospace, share จริงจาก fit math, เข้า chrome/label refresh) */
+    private fun synthBtn(label: String, fire: () -> Unit): BodyItem {
+        val b = Button(context).apply {
+            text = display(label)
+            setTypeface(Typeface.MONOSPACE)
+            isAllCaps = false
+            minimumWidth = 0
+            setOnClickListener { fire() }
+        }
+        keyButtons += b to label // เข้า pool เดียว = applyChromeToButtons/refreshKeyLabels เห็นด้วย
+        return BodyItem(b, label, fire = fire)
+    }
+
     private fun buildRow() {
         // popup ที่ anchor อยู่กับ view ใกล้ถูกลบ (preset reload ตอน popup เปิด) = ต้องปิดก่อน
         // ไม่งั้น PopupWindow ลอยค้าง anchored กับ view ที่หลุดจาก tree แล้ว (review M2)
@@ -185,6 +239,9 @@ class ExtraKeysBar(
                 else -> bodyItems += keyBtn(b)
             }
         }
+        // tmux mode เปิดอยู่ = สร้างปุ่ม prefix/quick ใหม่เข้า keyButtons pool (ถูกล้างไปข้างบน) —
+        // state (armed/label/callback) คงเดิม,เฉพาะ view ที่สร้างใหม่
+        tmuxBtns = buildTmuxBtns()
         // preset reload = reset fold state (setLayout); คำนวณใหม่หลัง measure ผ่าน relayoutBody
         applyFold(0)
         applyChromeToButtons() // ปุ่มใหม่จาก buildRow ต้องได้สี chrome ปัจจุบัน (task 9)
@@ -202,7 +259,7 @@ class ExtraKeysBar(
         releaseStrandedPresses()
         row.removeAllViews()
         // parked (l): การซอย head/tail ผ่าน foldSplit (pure) = ลำดับที่ test ตารางไว้คือลำดับที่แถวจริงใช้
-        val (head, tail) = foldSplit(bodyItems, overflow)
+        val (head, tail) = foldSplit(shownItems(), overflow)
         folded = tail
         for (item in head) {
             row.addView(item.view, LinearLayout.LayoutParams(0, LayoutParams.MATCH_PARENT))
@@ -230,7 +287,7 @@ class ExtraKeysBar(
      * ปุ่มเยอะเกิน touch slots (count > k) → applyFold ยุบหางไป popup ⋯ (ADR 0002 Consequences)
      */
     private fun relayoutBody() {
-        val total = bodyItems.size
+        val total = shownItems().size
         if (total == 0 || row.width == 0) return
         val bodyDp = (row.width / resources.displayMetrics.density).toInt()
         val fit = KeysBarFit.widths(total, bodyDp)
@@ -478,6 +535,21 @@ class ExtraKeysBar(
         }
     }
 }
+
+/**
+ * ticket tmux/05: snapshot ของ tmux mode ที่ host push เข้า bar ต่อ pane active (view-state เท่านั้น —
+ * state machine จริงคือ `TmuxPrefixState` ที่ MainActivity; bar เป็น viewer/echo ตาม pattern ⌨-IME)
+ *  - `prefixLabel` = "C-b"/"C-a" (display อย่างเดียว — byte จริงอยู่ที่ state)
+ *  - `armed` = pending → row สลับเป็น quick-keys (Q2 swap-in-place)
+ *  - callbacks: prefix tap = arm/literal (host ตัดสิน), command tap = host ขอ prefix ผ่าน state แล้วเขียน
+ */
+class TmuxBarState(
+    val prefixLabel: String,
+    val armed: Boolean,
+    val onPrefixTap: () -> Unit,
+    val commands: List<TmuxPreset.QuickKey>,
+    val onCommand: (TmuxPreset.QuickKey) -> Unit,
+)
 
 /**
  * entry หนึ่งของ popup ⋯ (fix round Important-1) — pure data (no View) = รัน/table test บน JVM ได้;

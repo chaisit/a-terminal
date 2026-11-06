@@ -14,3 +14,10 @@ internal fun canShowDialog(finishing: Boolean, destroyed: Boolean): Boolean = !f
 /** show() เฉพาะ activity ที่ยังรอด — else no-op */
 internal fun AlertDialog.Builder.showGuarded(on: Activity): AlertDialog? =
     if (canShowDialog(on.isFinishing, on.isDestroyed)) show() else null
+
+/**
+ * showGuarded สำหรับ dialog ที่ override ปุ่ม positive เอง (สร้างไว้ก่อนแล้ว setOnShowListener) —
+ * guard เดียวกันเป๊ะ (finishing/destroyed = no-op) แต่ตัว dialog ถูก create ไว้แล้ว
+ */
+internal fun AlertDialog.showGuarded(on: Activity): Boolean =
+    if (canShowDialog(on.isFinishing, on.isDestroyed)) { show(); true } else false

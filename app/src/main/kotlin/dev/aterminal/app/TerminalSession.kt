@@ -72,4 +72,10 @@ class TerminalSession(view: View, webView: WebView? = view as? WebView) {
 
     /** dial ที่ user สั่งเอง: ต่อไม่ได้ให้แจ้ง error แล้วหยุด ไม่เข้า backoff จนกว่าจะเคย CONNECTED ในรอบนี้ */
     var manualDial = false
+
+    /**
+     * ticket tmux/04: OSC 0/2 → tab pill (webview = Droid.onTerminalTitle, native = engine.onOsc)
+     * gate เป็น per-pane และ **ไม่ reset ข้าม dial** (no clear-back ตาม Q2 — ≡ desktop terminal)
+     */
+    val titleGate = TerminalTitleGate()
 }

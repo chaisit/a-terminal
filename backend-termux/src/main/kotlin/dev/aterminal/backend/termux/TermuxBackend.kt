@@ -8,7 +8,7 @@ import dev.aterminal.core.TerminalBackend
 /**
  * TermuxBackend — backend "local shell" โดยไม่สร้าง userland เอง (Android 10+ W^X block exec จาก app data)
  *
- * แผน 2 ทาง (ตกลงแล้วใน docs/architecture-map.md):
+ * แผน 2 ทาง (ตกลงแล้ว):
  *  A. localhost-SSH: ผู้ใช้รัน sshd ใน Termux (pkg install openssh; termux-ssh-setup; sshd)
  *     → delegate = SshBackend("127.0.0.1", 8022) — **wired แล้ว round 6 ผ่าน factory injection**
  *     ข้อดี: streaming เต็ม, resize จริง, ไร้ permission พิเศษ
@@ -27,6 +27,9 @@ class TermuxBackend(
     override var onData: (ByteArray) -> Unit = {}
     override var onClosed: (CloseReason) -> Unit = {}
     private var delegate: TerminalBackend? = null
+
+    // tmux/02: delegate คือ SshBackend เสมอ (Termux = sshd บนเครื่อง) → capability gate เห็น version ผ่านทางนี้
+    override val tmuxCapabilities: dev.aterminal.core.TmuxCapabilities? get() = delegate?.tmuxCapabilities
 
     override suspend fun connect(startup: StartupArgs) {
         val f = factory ?: throw BackendError(

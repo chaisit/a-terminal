@@ -10,6 +10,7 @@ import android.widget.ArrayAdapter
 import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
@@ -148,6 +149,31 @@ class ConnectUi(private val act: MainActivity) {
         val portLabel = TextView(act).apply { text = "Port"; visibility = TextView.GONE }
         val port = edit(form, "Port", (existing?.port ?: 22).toString(), number = true)
         val user = edit(form, "User", existing?.user ?: "")
+        // tmux/01 (WT profile.commandline): remote command แทน login shell — ว่าง = null = shell เดิม (clearable)
+        // review tmux/01: exact bytes = remote shell command → ปิด autocorrect/suggest/autocapitalize (VISIBLE_PASSWORD variation = no word-completion)
+        val commandLine = edit(form, "Command (optional, e.g. ${TmuxPreset.commandline})", existing?.commandline ?: "").apply {
+            // (setSuggestionsEnabled ไม่มีใน public SDK — VISIBLE_PASSWORD variation ปิด word-completion อยู่แล้ว)
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+        }
+        // ticket tmux/04 (Q1, user ตสิน 11-05): preset = ปุ่มเปิด dialog snippet + copy เท่านั้น
+        // ห้าม auto-fill/เขียนทับ commandLine — user tap เองจึงเห็น (echo ไม่มี tmux = ซ่อนตาม field บน)
+        val tmuxBtn = android.widget.Button(act).apply {
+            text = "📋 tmux setup…"
+            visibility = TextView.GONE
+            setOnClickListener { showTmuxPresetDialog() }
+        }
+        form.addView(tmuxBtn)
+        // ticket tmux/05: tmux keys mode (prefix button + quick-keys row) — ซ่อนกับ echo เหมือน Command
+        val tmuxKeys = CheckBox(act).apply {
+            text = "📟 tmux keys (prefix button + quick-keys row)"
+            isChecked = existing?.tmuxKeys ?: false
+            visibility = TextView.GONE
+        }
+        form.addView(tmuxKeys)
+        val tmuxPrefixEdit = edit(form, "tmux prefix (optional, e.g. C-a)", existing?.tmuxPrefix ?: "").apply {
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+            visibility = TextView.GONE
+        }
         val authNames = listOf("Password", "Private key", "None")
         val auth = Spinner(act).apply {
             adapter = ArrayAdapter(act, android.R.layout.simple_spinner_dropdown_item, authNames)
@@ -177,6 +203,10 @@ class ConnectUi(private val act: MainActivity) {
             port.visibility = if (hideNet) TextView.GONE else TextView.VISIBLE
             // echo = ไม่ต้องมี network + auth section เลย (Save บังคับ none อยู่แล้ว — ซ่อนกันสับสน)
             user.visibility = if (t == "echo") TextView.GONE else TextView.VISIBLE
+            commandLine.visibility = if (t == "echo") TextView.GONE else TextView.VISIBLE
+            tmuxBtn.visibility = if (t == "echo") TextView.GONE else TextView.VISIBLE
+            tmuxKeys.visibility = if (t == "echo") TextView.GONE else TextView.VISIBLE
+            tmuxPrefixEdit.visibility = if (t != "echo" && tmuxKeys.isChecked) TextView.VISIBLE else TextView.GONE
             authLabel.visibility = if (t == "echo") TextView.GONE else TextView.VISIBLE
             auth.visibility = if (t == "echo") TextView.GONE else TextView.VISIBLE
             val showAuth = t != "echo" && auth.selectedItemPosition == 1
@@ -184,6 +214,7 @@ class ConnectUi(private val act: MainActivity) {
             // edit profile เดิมที่ auth=key อยู่แล้ว: ให้เห็น alias ค้าง (เว้นแต่ import ใหม่ที่ label เปลี่ยนเอง)
             keyLabel.visibility = if (showAuth || (t != "echo" && keepAlias != null && auth.selectedItemPosition == 1)) TextView.VISIBLE else TextView.GONE
         }
+        tmuxKeys.setOnCheckedChangeListener { _, _ -> applyTypeVisibility() } // prefix field ตาม checkbox
         type.onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
             override fun onItemSelected(p: android.widget.AdapterView<*>?, v: android.view.View?, pos: Int, id: Long) = applyTypeVisibility()
             override fun onNothingSelected(p: android.widget.AdapterView<*>?) {}
@@ -194,37 +225,87 @@ class ConnectUi(private val act: MainActivity) {
         }
         applyTypeVisibility()
 
-        AlertDialog.Builder(act)
+        // save = function ที่ return true เมื่อ "ปิด dialog ได้" (save สำเร็จ)
+        // fix tmux/05 (E2E 11-05): ปุ่ม positive ของ AlertDialog *auto-dismiss เสมอ* หลัง onClick —
+        // `return@setPositiveButton` กันปิดไม่ได้ = validation fail แล้ว input หายทั้งฟอร์ม (Host/key validation
+        // เก่าก็โดนเหมือนกัน) → override click listener เองหลัง show, dismiss เฉพาะ case ที่ save สำเร็จ
+        fun trySave(): Boolean {
+            val t = typeNames[type.selectedItemPosition]
+            val h = host.text.toString().trim()
+            if (t == "ssh" && h.isEmpty() && existing?.host == null) { toast("Host required"); return false }
+            val alias = when {
+                t == "echo" -> null
+                auth.selectedItemPosition == 1 -> pendingKeyAlias ?: keepAlias
+                else -> null
+            }
+            if (t != "echo" && auth.selectedItemPosition == 1 && alias == null) {
+                toast("Import private key before saving"); return false
+            }
+            // tmux/05: prefix = exact bytes ที่ bar จะส่ง — เก็บเฉพาะ form ที่ parse ได้ (Q1: toast แล้วไม่ save)
+            // review fix: gate ด้วย isChecked — field ซ่อน (ไม่ได้เปิด tmux mode) ห้ามบล็อก Save เด็ดขาด
+            val prefixSpec = tmuxPrefixEdit.text.toString().trim()
+            if (t != "echo" && tmuxKeys.isChecked && prefixSpec.isNotEmpty() && TmuxPrefixState.parseSpec(prefixSpec) == null) {
+                toast("Prefix must look like C-a (C + one letter)"); return false
+            }
+            val base = existing ?: Profile(guid = UUID.randomUUID().toString())
+            val p = base.copy(
+                name = name.text.toString().ifBlank { h.ifBlank { base.name ?: "profile" } },
+                type = t,
+                host = if (t == "termux") "127.0.0.1" else h.ifBlank { base.host },
+                port = if (t == "termux") 8022 else port.text.toString().toIntOrNull() ?: base.port,
+                user = user.text.toString().ifBlank { base.user },
+                authMethod = if (t == "echo") "none"
+                    else when (auth.selectedItemPosition) { 1 -> "key"; 2 -> "none"; else -> "password" },
+                keyAlias = alias,
+                commandline = if (t == "echo") base.commandline // echo ไม่ใช้ exec — ห้าม destroy ค่าที่ save ไว้ (กับดักทางเดียวแบบ keyAlias round 6)
+                    else commandLine.text.toString().trim().ifBlank { null }, // ว่าง = ลบกลับเป็น login shell
+                tmuxKeys = if (t == "echo") base.tmuxKeys else tmuxKeys.isChecked, // echo = ซ่อน field → ห้าม destroy เช่นกัน
+                // review fix: checkbox ปิด = ทิ้ง spec ที่แก้ค้าง (field มองไม่เห็น ห้ามมีผลเงียบ ๆ)
+                tmuxPrefix = if (t == "echo") base.tmuxPrefix
+                    else if (tmuxKeys.isChecked) prefixSpec.ifBlank { null } else null,
+            )
+            pendingKeyAlias = null
+            act.saveProfile(p)
+            if (existing == null) act.connectProfile(p)
+            // fix tmux/05: template จริง (ของเดิม print "$" + "{p.name}" ออกมาตรง ๆ — '${'$'}' ไม่ใช่ escape ของ template)
+            else toast("saved " + p.name)
+            return true
+        }
+        val dlg = AlertDialog.Builder(act)
             .setTitle(if (existing == null) "Add profile" else "Edit profile")
             .setView(form)
-            .setPositiveButton("Save") { _, _ ->
-                val t = typeNames[type.selectedItemPosition]
-                val h = host.text.toString().trim()
-                if (t == "ssh" && h.isEmpty() && existing?.host == null) { toast("Host required"); return@setPositiveButton }
-                val alias = when {
-                    t == "echo" -> null
-                    auth.selectedItemPosition == 1 -> pendingKeyAlias ?: keepAlias
-                    else -> null
-                }
-                if (t != "echo" && auth.selectedItemPosition == 1 && alias == null) {
-                    toast("Import private key before saving"); return@setPositiveButton
-                }
-                val base = existing ?: Profile(guid = UUID.randomUUID().toString())
-                val p = base.copy(
-                    name = name.text.toString().ifBlank { h.ifBlank { base.name ?: "profile" } },
-                    type = t,
-                    host = if (t == "termux") "127.0.0.1" else h.ifBlank { base.host },
-                    port = if (t == "termux") 8022 else port.text.toString().toIntOrNull() ?: base.port,
-                    user = user.text.toString().ifBlank { base.user },
-                    authMethod = if (t == "echo") "none"
-                        else when (auth.selectedItemPosition) { 1 -> "key"; 2 -> "none"; else -> "password" },
-                    keyAlias = alias,
-                )
-                pendingKeyAlias = null
-                act.saveProfile(p)
-                if (existing == null) act.connectProfile(p) else toast("saved ${'$'}{p.name}")
-            }
+            .setPositiveButton("Save", null)
             .setNegativeButton("Cancel", null)
+            .create()
+        dlg.setOnShowListener {
+            dlg.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                if (trySave()) dlg.dismiss()
+            }
+        }
+        dlg.showGuarded(act)
+    }
+
+    /**
+     * ticket tmux/04 (Q1): dialog = exact snippet ของ ~/.tmux.conf บน server (monospace, เลือก copy บางส่วนได้)
+     *  - copy ทั้งก้อนผ่าน entry เดียวกับ terminal clipboard (armClipboard re-arm — ไม่ใช่ setPrimaryClip ดิบ)
+     *  - **no auto-fill**: ไม่มีทางใดใน dialog ที่แตะ commandLine — user paste เองบนเครื่อง server
+     */
+    fun showTmuxPresetDialog() {
+        act.closeImeForMenus() // task 10 menu policy — dialog ห้าม IME ค้างทับ
+        val pad = (16 * act.resources.displayMetrics.density).toInt()
+        val body = ScrollView(act).apply {
+            addView(TextView(act).apply {
+                text = TmuxPreset.snippet
+                typeface = android.graphics.Typeface.MONOSPACE
+                setTextIsSelectable(true)
+                setPadding(pad, pad / 2, pad, pad / 2)
+            })
+        }
+        AlertDialog.Builder(act)
+            .setTitle("tmux preset — paste into ~/.tmux.conf")
+            .setView(body)
+            .setPositiveButton("Copy snippet") { _, _ -> act.copyTextToClipboard(TmuxPreset.snippet) }
+            .setNegativeButton("Close", null)
             .showGuarded(act)
     }
 
