@@ -15,10 +15,13 @@ A Windows Terminal style SSH client for Android, with tabs, split panes and a
 - Automatic reconnect with backoff; a changed host key is always refused
 - Two terminal engines: xterm.js in a WebView (default) and a native Kotlin engine ([aterminal-engine](https://github.com/chaisit/aterminal-engine))
 - Unicode 11 widths in both engines, so emoji and Thai line up under tmux
+- tmux interop: a profile `commandline` like `tmux new -A -s main` so every redial rejoins the same
+  session; tab titles follow `set-titles`; a copy-only `.tmux.conf` snippet; and a **tmux keys** mode —
+  prefix button plus a quick-keys row (`% c d z n p w x [ s ,` and arrows)
 - Hardware keyboards, Windows Terminal style keybindings, find, and selection
 - Local shell through Termux, by connecting to its `sshd`
 
-Android 10 (API 29) or later.
+Android 10 (API 29) or later. Planned work is in [ROADMAP.md](ROADMAP.md).
 
 ## Install
 
