@@ -88,6 +88,13 @@ class TerminalEngine(cols0: Int = 80, rows0: Int = 24, val historySize: Int = 90
 
     fun write(bytes: ByteArray) = parser.feed(bytes)
 
+    /**
+     * inject older lines above the scrollback (host history pull) — oldest-first, refs aliased, screen untouched.
+     * returns the net content shift (lines the cap retained): the host adds it to a pinned scroll offset so the view stays stable.
+     * alt buffer gets the same treatment — harmless: its lines are not scrolled anyway (maxHistory=0 → all refused).
+     */
+    fun prependHistory(incoming: List<dev.aterminal.engine.term.TermLine>): Int = buf.prependHistory(incoming)
+
     // ---------- proto cells ----------
     /**
      * the bundle's _eraseAttrData → getNullCell: code0 blank (ch="") with default fg + bg = pen bg (color+mode) + attrs cleared
@@ -319,7 +326,10 @@ class TerminalEngine(cols0: Int = 80, rows0: Int = 24, val historySize: Int = 90
         val ps = IntArray(params.size) { if (params[it] < 0) 0 else params[it] }
         when {
             marker == '?'.code -> csiDec(ps, intermediates, final)
-            marker != 0 -> {} // <,>,=: no handler → swallow (but case-7 still clears joinState)
+            // DA2 (`CSI > c`): reply matches xterm.js 5.5 → `>0;276;0c` (its patchlevel 276);
+            // the reply never touches grid state — DA2 is a read-only probe, exactly like DA1
+            marker == '>'.code && final == 'c'.code -> onResponse("\u001b[>0;276;0c")
+            marker != 0 -> {} // <, =, : → no handler → swallow (but case-7 still clears joinState)
             intermediates.isNotEmpty() -> when {
                 intermediates[0] == ' '.code && final == 'q'.code -> {} // DECSCUSR: state-only (no renderer here)
                 intermediates[0] == '"'.code && final == 'q'.code -> decsca(ps) // DECSCA (g11u12 gold-pinned)

@@ -94,6 +94,9 @@ fun ATerminalTabBar(
     appVersion: String,     // versionName ดิบ (ไม่มี v) — บรรทัดท้ายเมนู ⋮
     statusText: String,
     statusColor: Color,
+    // tmux/08b: 🕘 ทางเข้า history overlay — โผล่เมื่อ puller armed เท่านั้น (flag มาจาก Activity, เมนูห้ามมี logic)
+    historyAvailable: Boolean = false,
+    onOpenHistory: () -> Unit = {},
     onClose: (Long) -> Unit,
     onMenu: (Long) -> Unit,
     // task 10: policy "menu = ปิด IME ก่อน" อยู่ฝั่ง Activity (composable ไม่มี Activity ref) —
@@ -306,6 +309,9 @@ fun ATerminalTabBar(
                 OverflowEntry("Copy IME log", chrome) { overflowMenu = false; onOverflow(OverflowItemId.copyImeLog) }
                 OverflowEntry("⬇ Export settings.json", chrome) { overflowMenu = false; onOverflow(OverflowItemId.exportSettings) }
                 OverflowEntry("⬆ Import settings.json…", chrome) { overflowMenu = false; onOverflow(OverflowItemId.importSettings) }
+                if (historyAvailable) {
+                    OverflowEntry("🕘 Older history", chrome) { overflowMenu = false; onOpenHistory() }
+                }
                 OverflowEntry("📄 Open source licenses", chrome) { overflowMenu = false; onOverflow(OverflowItemId.licenses) }
                 HorizontalDivider(color = chrome.pillIdleBg)
                 OverflowEntry("🔄 Check for updates", chrome) { overflowMenu = false; onOverflow(OverflowItemId.checkUpdates) }
@@ -317,6 +323,53 @@ fun ATerminalTabBar(
                     color = chrome.textIdle,
                     fontSize = 11.sp,
                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp),
+                )
+            }
+        }
+    }
+}
+
+/**
+ * ticket tmux/09: แถว window pills (แถวที่ 2 ของ chrome — user ruling 11-08: โผล่เฉพาะเมื่อ control session of focused pane มีข้อมูล)
+ *  - pills = tmux windows (tap = select-window @id) — concept คนละชุดกับ pills ของ tab ในแถบบน (ห้ามสับสน: แถบบน = tabs, แถวล่าง = windows)
+ *  - active = pillActiveBg (เข้มกว่า idle ตาม ChromePalette rule เดิม); activity = `!` badge หน้าชื่อ (จาก marker prefix)
+ *  - windows ว่าง = composable หายทั้งแถว (zero height = chrome เดิมของ non-tmux เป๊ะ)
+ *  - ไม่มีอะไร focusable ในแถวนี้ (focus recipe เดิม: strip ห้ามฉก IME focus จาก WebView)
+ */
+@Composable
+fun ATerminalWindowStrip(
+    windows: List<dev.aterminal.core.WindowStrip.Window>,
+    chrome: ChromeColors,
+    onSelect: (String) -> Unit,
+) {
+    if (windows.isEmpty()) return
+    val scroll = rememberScrollState()
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(36.dp)
+            .background(chrome.barBg)
+            .horizontalScroll(scroll)
+            .padding(horizontal = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        windows.forEach { w ->
+            Row(
+                modifier = Modifier
+                    .padding(horizontal = 2.dp)
+                    .height(28.dp)
+                    .clip(RoundedCornerShape(6.dp))
+                    .background(if (w.active) chrome.pillActiveBg else chrome.pillIdleBg)
+                    .clickable { onSelect(w.id) }
+                    .padding(horizontal = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    (if (w.activity) "!" else "") + w.name,
+                    color = if (w.active) chrome.textActive else chrome.textIdle,
+                    fontSize = 12.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
                 )
             }
         }

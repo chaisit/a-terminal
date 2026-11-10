@@ -103,7 +103,7 @@ class AssetApiGuardTest {
         assertTrue("""this._keyDownSeen=!0,this._dataAlreadySent="",""" in js)
     }
 
-    // P4 send-then-clear: ทุกจุดส่ง bytes ใน vendored xterm ต้องเคลียร์ helper textarea (ดู docs/xterm-umd-patch.md) ----
+    // P4 send-then-clear: ทุกจุดส่ง bytes ใน vendored xterm ต้องเคลียร์ helper textarea (ดู docs/xterm-patches.md) ----
     @Test
     fun `bundled xterm — P4 send-then-clear ครบทุก send site + shim clearTimeout ก่อน clear`() {
         val js = File("src/main/assets/xterm/xterm.js").readText()
@@ -134,5 +134,54 @@ class AssetApiGuardTest {
         assertTrue("IC ต้อง null ตอน gate ปิด", "onCreateInputConnection" in kt)
         // HW-5c: วาล์ว+restartInput ต้องครอบ ทุก tab (viewClicked-reopen ข้าม tab ของ vendor IMS)
         assertTrue("วาล์ว/preempt ต้องวนทุก tab (manager.ids)", Regex("""for \(id in manager\.ids\(\)\)""").containsMatchIn(kt))
+    }
+
+    // ---- ticket tmux/03: OSC 52 bridge ต้องมีครบทั้งสอง renderer (webview = JS handler, native = engine onOsc) ----
+    @Test
+    fun `osc52 bridge — webview handler + native route + query reply path`() {
+        val html = asset("terminal.html")
+        // วัด node จริง (11-07): class ที่ bundle export ไม่มี registerOscHandler บน prototype —
+        // ทางเข้าที่ expose คือ term.parser (facade) — เรียกตรง term.* = TypeError พังทั้ง boot script
+        // และ facade นี้ wrap handler เป็น function ล้วน (form {handle} object = "this._handler is not a function" — วัด node)
+        assertTrue("terminal.html ต้อง register OSC52 ผ่าน parser facade เท่านั้น",
+            Regex("""parser\.registerOscHandler\(\s*52\s*,""").containsMatchIn(html))
+        assertFalse("ห้ามเรียก term.registerOscHandler ตรง (bundle นี้ไม่มี — วัด prototype แล้ว)",
+            Regex("""term\.registerOscHandler\(""").containsMatchIn(html))
+        assertTrue("payload ต้องถึง Kotlin ผ่าน Droid.osc52", "Droid.osc52(" in html)
+        val kt = File("src/main/kotlin/dev/aterminal/app/MainActivity.kt").readText()
+        assertTrue("SessionBridge ต้อง expose osc52 ให้ JS", Regex("@JavascriptInterface[\\s\\S]{0,120}fun osc52\\(").containsMatchIn(kt))
+        assertTrue("native engine onOsc ต้อง route code 52 (≡ webview)", Regex("52\\s*->\\s*handleOsc52\\(").containsMatchIn(kt))
+        // query (`?`) ต้องตอบจาก clipboard และตอบกลับเข้า pty — decoder เดียวกันสอง path (OscClipboard)
+        assertTrue("query reply ต้อง encode ผ่าน OscClipboard.encodeReply", "OscClipboard.encodeReply(" in kt)
+        assertTrue("ทั้งสอง path ใช้ decoder เดียวกัน", Regex("handleOsc52\\(session\\(\\), payload\\)|handleOsc52\\(s, text\\)").containsMatchIn(kt))
+    }
+
+    // ---- ticket tmux/08: history pull — ครบทุก hop ของ chain ขอบบน→exec→inject (ทั้งสอง renderer) ----
+    @Test
+    fun `history pull bridge — top-edge trigger, depths reader, scratch-parse inject`() {
+        val html = asset("terminal.html")
+        assertTrue("trigger ต้องผ่าน term.onScroll + gate (viewportY==0 && baseY>0)",
+            Regex("term\\.onScroll\\(\\(\\)\\s*=>").containsMatchIn(html) && "Droid.historyEdge()" in html)
+        assertTrue("depths ต้องนับ logical จาก isWrapped ฝั่ง core buffer", "L.lines.get(i).isWrapped" in html || "!L.lines.get(i).isWrapped" in html)
+        // inject = parse ผ่าน scratch terminal แล้ว ย้าย BufferLine จริง — ห้าม re-encode cell เองใน JS
+        assertTrue("scratch ต้อง parse ที่ cols เดียวกับ live",
+            "const cols = term._core._bufferService.cols;" in html && "scratchTerm(cols)" in html)
+        // isWrapped trap (11-07): wrap ตรง scrollBottom = scrollUp ไม่ติด flag (bundle literal) → scratch ต้อง no-scroll
+        assertTrue("scratch ต้องเป็นกระดาษ no-scroll (rows ใหญ่, scrollback 0) — ไม่ใช่ rows:1 (inject ไม่กลุ่ม = reflow ผิด)",
+            "rows: 512, scrollback: 0" in html && "sc.reset();" in html)
+        assertTrue("scratch ต้องใช้ Unicode 11 (ตารางกว้าง ≡ live + :engine — round 15 rule)",
+            "scratch.unicode.activeVersion = '11'" in html)
+        assertTrue("inject ต้องเป็น circular-index surgery + content-lock (ydisp shift)",
+            "L._startIndex = ((L._startIndex - kept) % M + M) % M;" in html && "b.ydisp += kept;" in html)
+        assertTrue("alt buffer ต้องถูกข้าม (no scrollback)", "b.hasScrollback()" in html)
+        val kt = File("src/main/kotlin/dev/aterminal/app/MainActivity.kt").readText()
+        assertTrue("SessionBridge ต้อง expose historyEdge/historyDepths ให้ JS",
+            Regex("@JavascriptInterface[\\s\\S]{0,120}fun historyEdge\\(").containsMatchIn(kt) &&
+                Regex("@JavascriptInterface[\\s\\S]{0,120}fun historyDepths\\(").containsMatchIn(kt))
+        assertTrue("inject ฝั่ง webview ต้องเรียก atermPrependHistory", "atermPrependHistory(" in kt)
+        // native: trigger ต้อง wired ที่ view (ไม่ใช่ path อื่น) + gate เดียวกับ 07 (probe สำเร็จเท่านั้น)
+        assertTrue("native onReachTop ต้อง wired ที่ createNativeSession", "tv.onReachTop = { requestHistoryPull(s) }" in kt)
+        assertTrue("puller ต้อง arm หลัง probe ยืนยัน tmux เท่านั้น (gate เดียวกับ 07 — ห้าม arm blind)",
+            Regex("historyPuller = HistoryPuller\\(").containsMatchIn(kt))
     }
 }

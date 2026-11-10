@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.5.14
+
+Everything that landed since 0.5.12 ships here: the rest of the tmux set, plus two fixes found in
+real-device testing of the unreleased 0.5.13 build along the way.
+
+### tmux
+
+- **Copy from tmux into Android.** When a profile sets `set-clipboard on` (the setup snippet does),
+  a copy-mode selection in tmux now reaches the Android clipboard: paste it into any other app, or
+  back into the terminal with **⚡**. Terminal query replies (cursor position, colours) are answered
+  quietly, so vim/htop start clean instead of printing junk.
+- **Read history past the scrollback.** While attached to a tmux session, the **⋮** menu grows
+  **🕘 Older history**: a read-only overlay of the server-side history that pages in more as you
+  scroll to its top edge, and closes itself when the session dies.
+- **A window strip for touch.** The same session also grows a row of pills under the top bar — one
+  per tmux window, marker on the active one, tap to switch. It appears only for tmux-attached panes
+  (zero height everywhere else), scrolls horizontally when narrow, clears itself on tab switch,
+  and rebuilds from the live connection after a reconnect.
+
+### fixes
+
+- Typing while the history overlay is open no longer leaks into the shell — the overlay is
+  genuinely read-only now (both the keyboard button and the keys bar stand down while it is up).
+- Switching tabs no longer drops and redials the SSH connection (a control-channel close was
+  doing socket I/O on the main thread; the tab dot stopped flashing red→yellow→green on every tap).
+
 ## 0.5.12
 
 Everything that landed since 0.5.10 ships here: a tmux interop set. The 0.5.11 build in between was

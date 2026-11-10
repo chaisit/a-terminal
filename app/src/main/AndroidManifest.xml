@@ -37,8 +37,10 @@
               root padding อิง insets ใน KeyboardWatcher — ห้ามย้าย listener ออกไปจากตัวนั้น)
              ครบทุกชนิด (พบจริงบน Honor: ค่าระบบเปลี่ยนระหว่างจอปิด แล้ว session หลุดตอนกลับมา, ManifestGuardTest กันไว้)
              ที่เหลือ (grid/engine/renderer re-fit) อยู่ใน MainActivity.onConfigurationChanged — ห้ามให้ recreate กลับมา -->
+        <!-- tmux/07: singleTask = tap alert notification ส่ง onNewIntent เข้า instance เดิม (session ไม่ recreate) -->
         <activity
             android:name=".MainActivity"
+            android:launchMode="singleTask"
             android:exported="true"
             android:resizeableActivity="true"
             android:configChanges="mcc|mnc|locale|touchscreen|keyboard|keyboardHidden|navigation|screenLayout|fontScale|uiMode|orientation|density|screenSize|smallestScreenSize|layoutDirection|colorMode|grammaticalGender|fontWeightAdjustment"

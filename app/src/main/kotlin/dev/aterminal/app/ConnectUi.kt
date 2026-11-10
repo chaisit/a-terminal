@@ -31,11 +31,22 @@ class ConnectUi(private val act: MainActivity) {
     private var importTarget: ((alias: String) -> Unit)? = null
 
     // ---------- profile list (task 7 round 23: slim = picker + Add เท่านั้น — action อื่นย้ายเข้า ⋮ overflow) ----------
+    // tmux/07: boot picker ของ empty tab เป็น dialog เดียวที่เด้งเอง (pagefinish) — ต้องปิดได้
+    // จาก path อื่น besides user tap (alert deep-link dial tab ข้างใต้ = dialog ทับ pane, วัด device 11-07)
+    private var profileListDialog: AlertDialog? = null
+
+    /** ปิด picker ที่ค้าง (no-op ถ้าไม่เปิด) — เรียกก่อน dial จาก alert deep-link */
+    internal fun dismissProfileList() {
+        profileListDialog?.dismiss()
+        profileListDialog = null
+    }
+
     fun showProfileList() {
         // task 10 (round 23): ทุก dialog ในไฟล์นี้เปิดหลัง closeImeForMenus() — menu/dialog = user สั่งปิด IME
         // (ADR 0001: ห้าม IME ค้างทับ dialog และห้าม auto-reopen; pinned โดย CloseImePolicyGuardTest)
         // toast() ไม่-count = ไม่ใช่ dialog, ไม่มี IME flow
         act.closeImeForMenus()
+        profileListDialog?.dismiss() // one picker at a time (boot path มี postDelayed ของตัวเอง — ห้ามซ้อน)
         val profiles = visibleProfiles()
         val titles = profiles.map { p ->
             val tail = when (p.type) {
@@ -45,7 +56,7 @@ class ConnectUi(private val act: MainActivity) {
             }
             (p.name ?: p.guid ?: "?") + tail
         } + listOf("➕ Add profile…")
-        AlertDialog.Builder(act)
+        profileListDialog = AlertDialog.Builder(act)
             .setTitle("New session")
             .setItems(titles.toTypedArray()) { d, which ->
                 when {
@@ -54,6 +65,7 @@ class ConnectUi(private val act: MainActivity) {
                 }
             }
             .setNegativeButton("Close", null)
+            .setOnDismissListener { if (profileListDialog === it) profileListDialog = null }
             .showGuarded(act)
     }
 

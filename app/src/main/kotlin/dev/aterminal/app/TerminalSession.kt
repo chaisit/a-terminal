@@ -57,6 +57,31 @@ class TerminalSession(view: View, webView: WebView? = view as? WebView) {
     var countdownSec = 0
 
     /**
+     * ticket tmux/07: ลูป wait-for ของ pane นี้ (arm หลัง probe ยืนยัน tmux, disarm ทุก dial ใหม่/disconnect/pane ตาย)
+     * หนึ่ง job ต่อ backend รุ่นปัจจุบัน — dial ใหม่ = cancel ตัวเก่าก่อนเสมอ (waiter เก่าบน connection ตายห้าม retry)
+     */
+    var alertJob: kotlinx.coroutines.Job? = null
+
+    /**
+     * ticket tmux/08: pull ประวัติที่ขอบบน — puller สร้างใหม่ทุก probe สำเร็จ (backend = object ใหม่ทุก dial)
+     * historyGen = anchor-invalidation counter: app resize/reflow เป็นคน bump, เปลี่ยนกลาง pull = ทิ้งทั้งหน้า (Q3)
+     */
+    internal var historyPuller: HistoryPuller? = null
+    var historyGen = 0
+
+    /** ticket tmux/08b: ทางเข้าของ history overlay (backend+target เดียวกับ puller, probe-armed เท่านั้น) */
+    internal var historySource: HistorySource? = null
+
+    /**
+     * ticket tmux/09: host ของ window strip (control session) — probe-armed เหมือน 07/08b แต่ **start เมื่อ pane นี้ถูก focus เท่านั้น**
+     * (host มีสิทธิเปิด ≤1 control session ทั้งเครื่อง — user ruling 11-08)
+     */
+    internal var stripHost: WindowStripHost? = null
+
+    /** webview: continuation รอการวัด depths ผ่าน evaluateJavascript round-trip (null = ไม่มีใครรอ) */
+    var historyDepthsCont: kotlinx.coroutines.CancellableContinuation<Pair<Int, Int>?>? = null
+
+    /**
      * T4 (round 12): dial generation — ทุก dial (auto/manual) จับคู่กับ gen;
      * schedule ใหม่หรือ manual connect = gen++ ซึ่ง "ยกเลิก" dial เก่าที่ in-flight
      * (stale dial ห้าม openSession — เจอจริง: blackhole matrix สร้าง session เกือกม้า 2 ตัวจาก

@@ -33,6 +33,7 @@ import dev.aterminal.core.ResolvedTable
 import dev.aterminal.core.strArg
 import dev.aterminal.engine.TerminalEngine
 import dev.aterminal.engine.term.Cell
+import dev.aterminal.engine.term.TermLine
 import dev.aterminal.render.input.BufferText
 import dev.aterminal.render.input.Finder
 import dev.aterminal.render.input.GestureAction
@@ -522,6 +523,7 @@ class TerminalView @JvmOverloads constructor(context: Context, attrs: AttributeS
                 val before = scroll.top
                 scroll.scrollBy(k, e.buf.baseY)
                 invalidate()
+                notifyIfAtTop() // tmux/08
                 if (scroll.top == before) { // ชนขอบ = หยุด (กัน v ค้างไร้ความหมาย)
                     flingTickRunning = false
                     return
@@ -560,6 +562,27 @@ class TerminalView @JvmOverloads constructor(context: Context, attrs: AttributeS
         engine?.let { scroll.onOutput(prevBaseY, it.buf.baseY, evicted) }
     }
 
+    // ---- tmux/08: history pull (host = HistoryPuller ผ่าน exec channel) ----
+    /** gesture ของ user ชนขอบบน (มี history) — host dedup เอง (one page per pull, Q4) */
+    var onReachTop: (() -> Unit)? = null
+
+    /** inject ประวัติที่ pull มาได้ (เก่า→ใหม่) เข้าเหนือ scrollback; view content-lock ตาม shift ที่ engine เก็บได้จริง */
+    fun injectHistory(incoming: List<TermLine>): Int {
+        val e = engine ?: return 0
+        val shift = e.prependHistory(incoming)
+        if (shift > 0) {
+            scroll.shiftForPrepend(shift, e.buf.baseY)
+            invalidate()
+        }
+        return shift
+    }
+
+    /** call site ของ user scroll ทุกทาง (fling/scrollOp/gesture) — trigger once-per-gesture-to-top พอแล้ว: puller กัน overlap ให้ */
+    private fun notifyIfAtTop() {
+        val e = engine ?: return
+        if (scroll.top == 0 && e.buf.baseY > 0) onReachTop?.invoke()
+    }
+
     /** runAction TERMINAL-target (scrollUp…scrollToBottom, T1) — คืน true เมื่อ handle ได้ */
     fun scrollOp(name: String): Boolean {
         val e = engine ?: return false
@@ -574,6 +597,7 @@ class TerminalView @JvmOverloads constructor(context: Context, attrs: AttributeS
             else -> return false
         }
         invalidate()
+        notifyIfAtTop() // tmux/08
         return true
     }
 
@@ -594,7 +618,7 @@ class TerminalView @JvmOverloads constructor(context: Context, attrs: AttributeS
         val e = engine ?: return
         when (a) {
             is GestureAction.ScrollBy -> {
-                if (e.buf.baseY != 0) { scroll.scrollBy(a.rows, e.buf.baseY); invalidate() }
+                if (e.buf.baseY != 0) { scroll.scrollBy(a.rows, e.buf.baseY); invalidate(); notifyIfAtTop() } // tmux/08
             }
             is GestureAction.MousePress -> feedMouse(0, MouseActions.PRESS, a.col, a.row)
             is GestureAction.MouseMotion -> feedMouse(0, MouseActions.MOTION, a.col, a.row)

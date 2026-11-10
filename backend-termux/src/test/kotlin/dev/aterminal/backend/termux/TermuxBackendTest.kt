@@ -20,6 +20,7 @@ private class FakeBackend : TerminalBackend {
     var closed = false
     var connectThrew: Exception? = null
     var connectCount = 0
+    override var onTmuxProbe: ((dev.aterminal.core.TmuxCapabilities?) -> Unit)? = null
 
     override suspend fun connect(startup: StartupArgs) {
         connectCount++
@@ -118,5 +119,28 @@ class TermuxBackendTest {
         assertEquals(1, fired)             // Normal หนึ่งครั้ง
         b.close()                          // close ซ้ำ = silent, delegate ถูก-consuming แล้ว
         assertEquals(1, fired)
+    }
+
+    // ---- tmux/07: onTmuxProbe ต้องถึง delegate ทั้ง set ก่อนและหลัง connect (app arm watcher ผ่านทางนี้) ----
+
+    @Test
+    fun `probe listener set before connect is handed to the delegate at wiring time`() = runBlocking {
+        val fake = FakeBackend()
+        val b = TermuxBackend(factory = { _, _ -> fake })
+        var armed = 0
+        b.onTmuxProbe = { armed++ }
+        b.connect(startup)
+        assertTrue("delegate ต้องได้ listener", fake.onTmuxProbe != null)
+        fake.onTmuxProbe!!.invoke(null)
+        assertEquals(1, armed)
+    }
+
+    @Test
+    fun `probe listener set after connect updates the live delegate too`() = runBlocking {
+        val fake = FakeBackend()
+        val b = TermuxBackend(factory = { _, _ -> fake })
+        b.connect(startup)
+        b.onTmuxProbe = { }
+        assertTrue("set หลัง connect ต้องถึง delegate", fake.onTmuxProbe != null)
     }
 }

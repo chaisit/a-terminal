@@ -171,6 +171,38 @@ class SshBackendTest {
             TestSshServer.recordedCommands.contains(TestSshServer.PROBE_COMMAND))
     }
 
+    @Test fun `probe listener hears the final caps so the app can arm the alert watcher`() {
+        // ticket tmux/07: app ต้องรู้ว่า probe จบ+เจอ tmux เมื่อไหร่ (watcher เริ่มหลัง caps ไม่ใช่ตอน dial)
+        // สัญญา: listener เรียก 1 ครั้งต่อ probe ที่จบ (gen-guarded เดียวกับ tmuxCapabilities) — thread ฝั่ง backend
+        TestSshServer.versionOutput = "tmux 3.4"
+        val b = newBackend()
+        val seen = java.util.concurrent.ConcurrentLinkedQueue<dev.aterminal.core.TmuxCapabilities?>()
+        b.onTmuxProbe = { seen += it }
+        runBlocking { b.connect(StartupArgs(commandline = null, startingDirectory = null, cols = 80, rows = 24)) }
+        awaitFirst(seen)
+        org.junit.Assert.assertEquals("listener ต้องได้ยินพอดี 1 ครั้ง: $seen", 1, seen.size)
+        org.junit.Assert.assertEquals(dev.aterminal.core.TmuxVersion(3, 4, null), seen.single()!!.version)
+    }
+
+    @Test fun `probe listener hears null when tmux is absent (watcher must not arm blind)`() {
+        TestSshServer.versionOutput = "bash: line 1: tmux: command not found"
+        val diags = java.util.concurrent.ConcurrentLinkedQueue<String>()
+        val b = newBackend(diagnostics = { diags += it })
+        // synchronizedList ไม่ใช่ CLQ: ค่าที่แจ้งคือ null ได้ (CLQ.add(null) = NPE — ฟาด listener กลับแบบทดสอบยาก)
+        val seen = java.util.Collections.synchronizedList(mutableListOf<dev.aterminal.core.TmuxCapabilities?>())
+        b.onTmuxProbe = { seen += it }
+        runBlocking { b.connect(StartupArgs(commandline = null, startingDirectory = null, cols = 80, rows = 24)) }
+        awaitFirst(seen)
+        org.junit.Assert.assertEquals("fail-soft ก็ต้องแจ้ง (null) — 1 ครั้ง: $seen diags=$diags", 1, seen.size)
+        org.junit.Assert.assertNull(seen.single())
+    }
+
+    /** listener ยิงจาก thread ฝั่ง backend — poll รอ element แรก (deadline 4s; assert จริงของ test ที่เรียกเป็นผู้ตัดสิน) */
+    private fun awaitFirst(seen: Collection<dev.aterminal.core.TmuxCapabilities?>) {
+        val deadline = System.currentTimeMillis() + 4000
+        while (System.currentTimeMillis() < deadline && seen.isEmpty()) Thread.sleep(50)
+    }
+
     @Test fun `probe uses a second exec channel without pty-req`() {
         TestSshServer.versionOutput = "tmux 3.6"
         val b = newBackend()

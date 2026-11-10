@@ -35,7 +35,49 @@ interface TerminalBackend {
      * null = ยัง probe ไม่เสร็จ / ไม่มี tmux / backend นี้ไม่ probe (echo) — ผู้เรียกต้อง fail-soft (ซ่อน feature)
      */
     val tmuxCapabilities: TmuxCapabilities? get() = null
+
+    /**
+     * tmux/07: แจ้งผล probe **หนึ่งครั้งต่อ probe ที่จบ** (ค่าสุดท้าย = `tmuxCapabilities` ที่ตั้งจริง) —
+     * app ใช้ arm alert watcher หลัง caps ยืนยันว่ามี tmux (ห้าม arm blind ตอน dial)
+     *  - เรียกบน thread ฝั่ง backend (probe daemon) — ผู้ฟังข้าม thread เอง
+     *  - backend ที่ไม่ probe (echo) = ไม่เรียกเลย (default no-op)
+     */
+    var onTmuxProbe: ((TmuxCapabilities?) -> Unit)?
+        get() = null
+        set(_) {}
+
+    /**
+     * tmux/06 (foundation ของ 07/08/09/10): one-shot exec บน connection เดิม — ไม่มี PTY, ไม่แตะ channel หลัก
+     *
+     * - request/response หนึ่งรอบ: ผูก timeout ให้เอง (deadline ครบ = ปิด channel แล้ว throw CHANNEL_FAILED)
+     * - timeoutMs <= 0 = ไม่มี deadline (tmux/07 waiter: command ที่รอข้าม ชม. เช่น `tmux wait-for`) — จบเมื่อ command exit หรือ caller cancel
+     * - cancellation: ผู้เรียก cancel ได้ — implementer ต้องปิด channel แล้วคืน CancellationException (ห้ามค้าง thread/pump)
+     * - exitCode != 0 = ผลปกติ (เช่น list-sessions บน server ว่าง) — transport fail เท่านั้นที่ throw
+     * - backend ที่ไม่มี exec channel (echo) = UNSUPPORTED ชัด ๆ — ห้ามเงียบเป็น empty success
+     */
+    suspend fun exec(command: String, timeoutMs: Long = 5_000L): ExecResult =
+        throw BackendError(BackendError.Code.UNSUPPORTED, "backend '$type' has no exec channel")
+
+    /**
+     * tmux/09: channel ยาวสำหรับ control session (`tmux -CC`) — exec **ที่มี PTY**
+     * (wire fact spike 11-08: `tmux -CC` บน pipe เปล่า = tcgetattr failed + exit 1 — PTY คือเงื่อนไข ไม่ใช่ option)
+     *
+     * - suspend จน channel เปิดเสร็จ (fail = throw BackendError, เช่น CHANNEL_FAILED เมื่อ server ปฏิเสธ exec/pty)
+     * - channel ที่สองบน connection เดียว — ต้องไม่แตะ channel หลัก (protocol เดียวกับ exec/probe)
+     * - [cols]/[rows] = PTY size ของ channel (control client ไม่ดึง size จาก PTY — แต่ tmux ยังต้องการ tty ที่ถูกขนาด)
+     * - ผู้เรียกปิด transport เอง (detach/close); connection ปิด = transport จบตาม (onClosed หนึ่งครั้ง)
+     * - backend ที่ไม่มี exec-PTY channel (echo) = UNSUPPORTED ชัด ๆ — ห้ามเงียบ
+     */
+    suspend fun openControlTransport(command: String, cols: Int, rows: Int): ControlTransport =
+        throw BackendError(BackendError.Code.UNSUPPORTED, "backend '$type' has no control channel")
 }
+
+/** ผล one-shot exec (tmux/06) — stdout/stderr decode UTF-8 เต็มก้อน, exitCode null = server ไม่ส่ง status */
+data class ExecResult(
+    val exitCode: Int?,
+    val stdout: String,
+    val stderr: String,
+)
 
 /** สิ่งที่ profile ต้องส่งให้ backend ตอนเปิด session (mapping ของ WT NewTerminalArgs) */
 data class StartupArgs(

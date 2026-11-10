@@ -2,9 +2,11 @@ package dev.aterminal.backend.ssh
 
 import dev.aterminal.core.BackendError
 import dev.aterminal.core.CloseReason
+import dev.aterminal.core.ExecResult
 import dev.aterminal.core.StartupArgs
 import dev.aterminal.core.TerminalBackend
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import org.apache.sshd.client.SshClient
 import org.apache.sshd.client.channel.ChannelShell
@@ -98,6 +100,10 @@ class SshBackend(
     @Volatile
     override var tmuxCapabilities: dev.aterminal.core.TmuxCapabilities? = null
         private set
+
+    /** tmux/07: ผู้ฟังผล probe (app arm alert watcher) — เรียกจาก probeTmux ใต้ gen guard เดียวกับ caps */
+    @Volatile
+    override var onTmuxProbe: ((dev.aterminal.core.TmuxCapabilities?) -> Unit)? = null
 
     // review tmux/02: epoch guard — probe เก่า (connection ก่อน redial) ห้ามเขียนทับผลของ connection ใหม่
     private val probeGeneration = java.util.concurrent.atomic.AtomicLong(0)
@@ -379,6 +385,8 @@ class SshBackend(
         private const val PROBE_READ_TIMEOUT_MS = 3_000L
         // output จริง = 1 บรรทัด (< 20 B); เกินนี้ = server แปลก/ป้อนขยะ — fail-soft ก่อน memory bomb (review tmux/02)
         private const val PROBE_MAX_BYTES = 4_096
+        // tmux/06: one-shot exec — list 3 ระดับยังเล็กมาก; เพดานกัน MITM-sshd mem-bomb (probe lesson)
+        internal const val EXEC_MAX_BYTES = 1_048_576
         private val PROBE_KEX_TIMEOUT = Duration.ofSeconds(10)
 
         internal const val DIAG_MAX_MESSAGE = 160
@@ -558,16 +566,214 @@ class SshBackend(
                 if (probeGeneration.get() == gen) { // connection ยังปัจจุบันเท่านั้นจึงรับผล
                     tmuxCapabilities = caps
                     diag("tmux probe -> ${caps?.version ?: "none"}")
+                    fireProbeListener(caps) // tmux/07: แจ้งผลสุดท้าย 1 ครั้ง (listener พัง ห้ามล้ม probe thread)
                 }
             } catch (t: Throwable) {
                 if (probeGeneration.get() == gen) { // exec ถูกปฏิเสธ/timeout = ไม่มี feature, ไม่ใช่ connection fail — ห้าม clobber ค่าของ connection ใหม่
                     tmuxCapabilities = null
                     diag("tmux probe failed ${describe(t)}")
+                    fireProbeListener(null)
                 }
             } finally {
                 runCatching { ch?.close(false) }
             }
         }.apply { isDaemon = true; name = "aterm-tmux-probe"; start() }
+    }
+
+    /** tmux/07: dispatch ให้ listener ที่ยังมีชีวิต (re-read @Volatile — ผู้ตั้งอาจ unset กลางทาง) — exception ของ listener กลืนที่นี่ (ห้ามล้ม probe thread) แต่ห้ามเงียบ (§Threading) */
+    private fun fireProbeListener(caps: dev.aterminal.core.TmuxCapabilities?) {
+        runCatching { onTmuxProbe?.invoke(caps) }
+            .onFailure { diag("tmux probe listener threw ${it.javaClass.simpleName}") }
+    }
+
+    /**
+     * tmux/06: one-shot exec — channel exec ที่สองไม่มี PTY (เหมือน probe แต่ throw ได้, stdout/stderr แยก, exit code คืน)
+     *
+     * - reuse exec pattern ที่ probe พิสูจน์แล้ว: poll available() ไม่ใช่ blocking read → deadline ตัดได้จริง,
+     *   forced-command ที่ไม่ exit ไม่ค้าง thread (probe fail-soft null, exec throw CHANNEL_FAILED เพราะ caller ต้องการรู้)
+     * - I/O off-main เสมอ (Dispatchers.IO): exec เรียกจาก UI suspend ได้ปลอดภัย
+     * - cancellation: ensureActive() ทุกรอบ poll → cancel = throw CancellationException + finally ปิด channel (main shell ไม่สะเทือน)
+     * - stderr ไม่ redirect (ต่างจาก probe ที่ merge): caller แยก "no sessions" (stderr) ออกจาก output ปกติได้
+     * - mem-bomb guard: stdout+stderr *รวมกัน* เกิน EXEC_MAX_BYTES = server/MITM ผิดปกติ → ทิ้งส่วนเกิน + exitCode=null (ข้อมูล truncated = ห้ามรายงาน exit 0 จริง)
+     * - งบเดียวทั้ง exec = timeoutMs: phase open ใช้ก่อน (เพดานย่อยที่ TIMEOUT), read loop ได้ส่วนที่เหลือ — deadline เช็คทุก iteration
+     * - timeoutMs <= 0 = ไม่มี deadline (tmux/07 waiter: `tmux wait-for` ที่รอเป็น ชม.ก็ได้) — จบด้วย exit ของ command หรือ cancel เท่านั้น
+     *   (open ยังเพดาน TIMEOUT กัน half-open/MITM; cap 1MiB ยังทำงาน — waiter ที่เงียบไม่แตะ cap)
+     * - exit code: exec จบจริง (exit-status) = ค่า Int; !=0 เป็นผลปกติ (no sessions=1), transport fail = throw
+     */
+    override suspend fun exec(command: String, timeoutMs: Long): ExecResult = withContext(Dispatchers.IO) {
+        val s = session ?: throw BackendError(BackendError.Code.CHANNEL_FAILED, "not connected")
+        var ch: org.apache.sshd.client.channel.ChannelExec? = null
+        try {
+            val bounded = timeoutMs > 0 // tmux/07: 0/ลบ = unbounded (waiter shape) — สัญญาที่ TerminalBackend.exec
+            val deadline = if (bounded) System.currentTimeMillis() + timeoutMs else Long.MAX_VALUE // งบรวมทั้ง exec: open + read (contract ของ caller)
+            ch = s.createExecChannel(command)
+            // stderr NOT redirected — แยก invertedOut/invertedErr; open ใช้งบของ caller ไม่ใช่ TIMEOUT 20s ของ connection (review tmux/06)
+            ch.open().verify(java.time.Duration.ofMillis(minOf(deadline - System.currentTimeMillis(), TIMEOUT.toMillis())))
+            val out = java.io.ByteArrayOutputStream()
+            val err = java.io.ByteArrayOutputStream()
+            val buf = ByteArray(4096)
+            var overflow = false
+            while (true) {
+                coroutineContext.ensureActive() // cancel = ออกทันที (finally ปิด channel)
+                if (bounded && System.currentTimeMillis() >= deadline) { // ท้าย loop ไม่ได้ — stream busy ต้องไม่เลี่ยง deadline (probe loop คือแบบ)
+                    diag("exec timeout after ${timeoutMs}ms: ${redact(command, listOf(host, user))}")
+                    throw BackendError(BackendError.Code.CHANNEL_FAILED, "exec timed out")
+                }
+                val oAvail = ch.invertedOut.available() // stdout ของ command (probe ใช้ stream เดียวกัน)
+                val eAvail = ch.invertedErr.available()
+                if (oAvail > 0 || eAvail > 0) {
+                    if (oAvail > 0) {
+                        val n = ch.invertedOut.read(buf, 0, minOf(oAvail, buf.size))
+                        if (n > 0) out.write(buf, 0, n)
+                    }
+                    if (eAvail > 0) {
+                        val n = ch.invertedErr.read(buf, 0, minOf(eAvail, buf.size))
+                        if (n > 0) err.write(buf, 0, n)
+                    }
+                    if (out.size() + err.size() >= EXEC_MAX_BYTES) { overflow = true; break } // cap *รวม* สอง stream (ต่อ stream = 2× ที่ doc สัญญา)
+                } else if (!ch.isOpen) {
+                    break // exec จบ (server ปิด channel) + drain หมดแล้ว — avail>0 branch เหนือกว่าจึงไม่มี byte ค้าง
+                } else {
+                    kotlinx.coroutines.delay(25) // ปล่อง poll — ไม่ใช่ blocking read
+                }
+            }
+            val code = if (overflow) null else runCatching { ch.exitStatus }.getOrNull()
+            ExecResult(
+                exitCode = code,
+                stdout = out.toString(Charsets.UTF_8), // decode ครั้งเดียว (chunk ข้าม byte ไม่ได้ — probe lesson)
+                stderr = err.toString(Charsets.UTF_8),
+            ).also { if (overflow) diag("exec output exceeded cap: ${redact(command, listOf(host, user))}") }
+        } catch (t: kotlinx.coroutines.CancellationException) {
+            throw t // cancel ต้อง propagate ไม่ใช่ swallow
+        } catch (t: BackendError) {
+            throw t // timeout ที่ throw เอง — ห้าม wrap ซ้ำ
+        } catch (t: Throwable) {
+            diag("exec failed: ${redact(command, listOf(host, user))} ${describe(t)}")
+            throw BackendError(BackendError.Code.CHANNEL_FAILED, "exec failed", t)
+        } finally {
+            runCatching { ch?.close(false) } //เสมอ: ปิด exec channel — main shell channel คนละตัว ไม่แตะ
+        }
+    }
+
+    /**
+     * tmux/09: control channel = exec **ที่มี PTY** ตัวที่ N บน connection เดียว (protocol เดียวกับ probe/exec: ไม่แตะ channel หลัก)
+     *
+     * - spike 11-08: `tmux -CC` บน pipe เปล่า = tcgetattr failed → ต้อง path เดียวกับ commandline ของ tmux/01
+     *   (createExecChannel + pty + **setUsePty(true)** — ctor ยัด usePty=false แม้ส่ง PtyChannelConfiguration: FACT tmux/01)
+     * - streaming=Async + redirectErrorStream ก่อน open (ข้อบังคับเดิมของ R4) —บน PTY stderr รวม stream เดียวอยู่แล้ว
+     * - open งบ TIMEOUT ของ connection: half-open/MITM ต้องไม่ทำ caller ค้าง (control session เปิดจาก UI flow)
+     */
+    override suspend fun openControlTransport(command: String, cols: Int, rows: Int): dev.aterminal.core.ControlTransport =
+        withContext(Dispatchers.IO) {
+            val s = session ?: throw BackendError(BackendError.Code.CHANNEL_FAILED, "not connected")
+            val pty = PtyChannelConfiguration().apply {
+                ptyType = "xterm-256color"
+                ptyColumns = cols
+                ptyLines = rows
+            }
+            val ch = s.createExecChannel(command, pty, mapOf("TERM" to "xterm-256color")).apply { setUsePty(true) }
+            ch.streaming = StreamingChannel.Streaming.Async
+            ch.isRedirectErrorStream = true
+            try {
+                ch.open().verify(TIMEOUT)
+            } catch (e: Exception) {
+                runCatching { ch.close(false) }
+                throw BackendError(BackendError.Code.CHANNEL_FAILED, "control channel rejected by $host:$port", e)
+            }
+            ControlChannel(ch, command)
+        }
+
+    /**
+     * transport ของ control session บน ChannelExec+PTY — pump/writer thread ของตัวเอง (pattern startPump/startStdinWriter:
+     * asyncOut = pending-read ครั้งเดียว, asyncIn = single-outstanding writeBuffer → writer thread เดียว serialized)
+     *
+     * close reason map ตาม connect (T3 round 12): exit=null = ท่อขาด (retryable), exit≠0 = คำสั่งพัง (ห้าม redial วน), exit=0/detach = Normal
+     * bytes deliver บน pump thread ของเรา — ControlSession/parser เป็น caller-cross-thread เอง (contract ที่ interface)
+     */
+    private inner class ControlChannel(
+        private val ch: org.apache.sshd.client.channel.ChannelExec,
+        private val command: String,
+    ) : dev.aterminal.core.ControlTransport {
+        private val done = AtomicBoolean(false)
+        @Volatile private var onClosedCb: ((CloseReason) -> Unit)? = null
+        private val commands = java.util.concurrent.LinkedBlockingQueue<ByteArray>()
+
+        override fun open(sink: (ByteArray) -> Unit, closed: (CloseReason) -> Unit) {
+            this.onClosedCb = closed
+            Thread {
+                val buf = ByteArrayBuffer(16 * 1024)
+                try {
+                    while (!done.get()) {
+                        val w0 = buf.wpos()
+                        val f = ch.asyncOut.read(buf)
+                        if (!f.await()) break
+                        val n = f.read
+                        if (n < 0) break // EOF = channel ปิด — จบ loop แล้วรายงานข้างล่าง
+                        if (n > 0) {
+                            sink(java.util.Arrays.copyOfRange(buf.array(), w0, w0 + n))
+                            buf.clear()
+                        }
+                    }
+                } catch (t: Throwable) {
+                    if (!done.get()) diag("control pump failed ${describe(t)}")
+                }
+                // closed ส่งท้าย pump thread เสมอ (ไม่ใช่ MINA close-future): bytes ที่ส่งมาก่อนหน้า
+                // ถูก deliver ครบบน thread เดียว = ลำดับ callback คงจริง + pump ตายผิดปกติก็ยัง มี closed (contract ที่ ControlTransport)
+                // exit-status ถึง client ก่อน channel_close เสมอ (T3 round 12) — ตอนนี้ reads หมดแล้ว จึงอ่านได้
+                finish()
+            }.apply { name = "aterm-ssh-control-pump"; isDaemon = true; start() }
+            Thread {
+                while (!done.get()) {
+                    val data = try {
+                        commands.poll(200, java.util.concurrent.TimeUnit.MILLISECONDS)
+                    } catch (t: Throwable) {
+                        break
+                    } ?: continue
+                    if (done.get()) break
+                    try {
+                        val f = ch.asyncIn.writeBuffer(ByteArrayBuffer(data))
+                        if (!f.await()) break
+                    } catch (t: Throwable) {
+                        if (!done.get()) diag("control write failed ${describe(t)}")
+                        break // closeFutureListener รายงานสถานะจริงเอง
+                    }
+                }
+            }.apply { name = "aterm-ssh-control-writer"; isDaemon = true; start() }
+        }
+
+        /** รายงานปิดหนึ่งครั้งจาก pump thread (ดูคอมเมนต์ท้าย pump loop); [close] ของ caller ทำ CAS ก่อน = จบเงียบตาม contract */
+        private fun finish() {
+            if (!done.compareAndSet(false, true)) return
+            val exit = runCatching { ch.exitStatus }.getOrNull()
+            diag("control channel closed exit=$exit cmd=${redact(command, listOf(host, user))}")
+            // listener throw = ความผิดผู้ฟัง — กลืนได้แต่ห้ามเงียบ (§Threading, precedent probeTmux)
+            try {
+                onClosedCb?.invoke(when {
+                    exit == null -> CloseReason.Error("control channel closed", retryable = true)
+                    exit != 0 -> CloseReason.Error("control command exited ($exit)", retryable = false)
+                    else -> CloseReason.Normal
+                })
+            } catch (t: Throwable) {
+                diag("control closed listener threw ${describe(t)}")
+            }
+        }
+
+        override fun write(data: ByteArray) {
+            if (!done.get()) commands.put(data) // หลัง close = no-op (fail-soft — contract เดียวกับ ControlSession)
+        }
+
+        override fun close() {
+            if (!done.compareAndSet(false, true)) return
+            // H2 (Honor 11-10): caller = main (WindowStripHost.stop ตอน syncStripFocus/สลับ tab) —
+            // ch.close(false) = graceful flush + channel_close = socket I/O บน caller →
+            // StrictMode NetworkOnMainThreadException → MINA ปิด *ทั้ง session* (red→yellow→green
+            // ทุก switch; repro บน emulator ได้ด้วย tab switch เดียว) — บทเรียน resize/R10 เดิม
+            // ทุก socket op ต้อง off-caller เสมอ (guard: MainThreadIoGuardTest + emulator gate)
+            Thread {
+                runCatching { ch.close(false) } // server เห็น channel_close → stdin EOF → `tmux -CC` ส่ง %exit จบเอง (spike fact 2)
+                    .onFailure { diag("control close failed ${describe(it)}") }
+            }.apply { name = "aterm-ssh-control-close"; isDaemon = true; start() }
+        }
     }
 
     override fun close() {

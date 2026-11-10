@@ -32,7 +32,7 @@
 <body>
 <div id="term"></div>
 <script src="xterm/xterm.js"></script>
-<script src="xterm/addon-canvas.js"></script>  <!-- round 15-HW-2: canvas renderer (vendor MIT, ดู docs/xterm-umd-patch.md) -->
+<script src="xterm/addon-canvas.js"></script>  <!-- round 15-HW-2: canvas renderer (vendor MIT, ดู docs/xterm-patches.md) -->
 <script src="xterm/addon-unicode11.js"></script>  <!-- round 15: emoji กว้าง 2 ช่อง ตรงกับ :engine (vendor MIT 0.8.0, ไม่ดัดแปลง) -->
 <script src="aterm-find.js"></script>  <!-- round 7: find bar (โปรเจกต์เขียน, zero patch) -->
 <script src="aterm-keys.js"></script>   <!-- round 7: chord dispatcher + markMode -->
@@ -199,6 +199,12 @@ term.onData(data => {
 term.onBinary(s => { if (window.Droid && Droid.onBinaryBytes) Droid.onBinaryBytes(btoa(s)); });
 // tmux/04: OSC 0/2 (tmux set-titles) → tab pill — Kotlin sanitize+debounce เอง, JS ส่งดิบทุกค่า
 term.onTitleChange(t => { if (window.Droid && Droid.onTerminalTitle) Droid.onTerminalTitle(t); });
+// tmux/03: OSC 52 clipboard — Terminal ที่ export ใน bundle ไม่มี registerOscHandler บน prototype
+// (วัด node จริง) — ทางเข้าที่ expose คือ parser facade; callback รับ text หลัง `52;` (วัด ≡ convention Kotlin)
+// data = ส่วนหลัง `52;` (≡ convention ฝั่ง Kotlin OscClipboard) — decode/clipboard/query reply ทั้งหมด
+// อยู่ฝั่ง Kotlin (OscClipboard + ClipboardManager); query ตอบเข้า pty ตรง ๆ ไม่ผ่าน JS.
+// return true = handled (กัน fallback handler อื่น/unknown-OSC noise)
+term.parser.registerOscHandler(52, function (data) { if (window.Droid && Droid.osc52) Droid.osc52(data); return true; });
 
 // round 21: modifier flush (ฝั่ง JS ของ native preemptComposition) — Gboard ส่งตัวอักษรเข้า
 // composing region แล้วนั่งรอ commit ตรงนั้น (วัดจริง: tap 'j' สองครั้งติด = onData 'jj' ก้อนเดียว
@@ -452,7 +458,7 @@ window.Aterm = {
 
 // ---- IME shim v2 (round 3) ----
 // การแก้จริงอยู่ใน vendored xterm.js (P1 retry-diff, P2 input rescue, P3 paste preventDefault
-// — ดู docs/xterm-umd-patch.md + tools/patch_xterm_ime.py)
+// — ดู docs/xterm-patches.md + tools/patch_xterm_ime.py)
 // shim เดิม round 2 (keydown 40ms fallback) = ตัวการ char ซ้ำ เพราะส่งโดยไม่รู้ว่า xterm ส่งแล้ว -> ตัดทิ้ง
 // ที่เหลือ = catcher สำเนาสุดท้าย: bubbling ของเรา chạy *หลัง* input handler ของ xterm; ถ้า xterm
 // (patched) ส่งแล้วมันจะ mark term._core._dataAlreadySent — cross-check ก่อนส่งเอง = ไม่มีซ้ำ
@@ -476,6 +482,97 @@ window.Aterm = {
 if (window.AtermFind) AtermFind.init(term);   // round 7 — init หลัง term.open() เสมอ
 if (window.AtermKeys) AtermKeys.init(term);
 AtermMods.init(term);                          // round 21 — ต้องอยู่หลัง term.open() (term.textarea เกิดตอน open)
+
+// ---- tmux/08: history pull (ขอบบน → Droid.historyEdge → Kotlin capture-pane → atermPrependHistory) ----
+// buffer surgery ผ่าน term._core internals = precedent ของไฟล์นี้เอง (_renderService/_compositionHelper/
+// _dataAlreadySent) — prepend เป็น data ไม่ใช่ event จึงไม่ต้องแตะ vendored UMD (กัน anchor เปราะ; surface lock ใน AssetApiGuardTest)
+(function historyPull() {
+  // trigger: ydisp==0 && baseY>0 — alt buffer (vim) baseY=0 = ไม่มี trigger, inject ก็ข้าม (hasScrollback false)
+  term.onScroll(() => {
+    const b = term.buffer.active;
+    if (b.viewportY === 0 && b.baseY > 0 && window.Droid) { try { Droid.historyEdge(); } catch (e) {} }
+  });
+
+  // depths = (logical, display) ของ scrollback [0, ydisp) — viewport ไม่ใช่ history (≡ native, ≡ capture ที่ -E -1)
+  window.atermHistoryDepths = function () {
+    try {
+      const L = term._core._bufferService.buffer;
+      const d = L.ydisp;
+      let logical = 0;
+      for (let i = 0; i < d; i++) if (L.lines.get(i) && !L.lines.get(i).isWrapped) logical++;
+      if (window.Droid) Droid.historyDepths(logical, d);
+    } catch (e) { /* Kotlin timeout (1.5s) = abort รอบ — ดีกว่าป้อน depth ปลอม */ }
+  };
+
+  // lines = plain strings (capture `-J` logical lines, เก่า→ใหม่) — parse ผ่าน terminal ลับที่ cols เดียวกับ live
+  // แล้ว **ย้าย BufferLine ที่จริง** เข้า live: width/wrap/combining ติดตั้งโดย parser เอง = parity สมบูรณ์,
+  // ไม่มีการ re-encode cell เองใน JS (นี่คือเหตุผลของ scratch terminal — ดูตั๋ว 08)
+  // isWrapped trap (test Kotlin `parseHistoryText keeps...` จับได้, bundle literal ยืนยัน 11-07): wrap ที่ตก
+  // แถว scrollBottom = scroll แล้ว *ไม่* ติด isWrapped → scratch rows=1 = inject history โดยไม่กลุ่มบรรทัดทั้งก้อน (reflow ผิดหลัง resize)
+  // → scratch rows ใหญ่ + เขียนเป็น chunk ที่ bound frag ≤ rows-2 (frag ≤ ceil(2·len/cols)) = no-scroll → ทุก wrap = mid-screen ≡ xterm
+  // twin: parseHistoryText (HistoryPuller.kt) ใช้ rule เดียวกันฝั่ง native — budget คนละค่า (512−2 vs 400) ห้ามคิดว่า sync กันอัตโนมัติ
+  window.atermPrependHistory = function (lines) {
+    try {
+      const b = term._core._bufferService.buffer;
+      if (!b.hasScrollback() || !lines || !lines.length) return; // alt buffer / ค่าวาง = ข้ามเงียบ
+      const cols = term._core._bufferService.cols;
+      const sc = scratchTerm(cols);
+      const budget = sc.rows - 2;
+      const fresh = [];
+      let i = 0;
+      const step = function () {
+        let sum = 0, j = i;
+        while (j < lines.length) {
+          const f = Math.max(1, Math.ceil(2 * lines[j].length / cols));
+          if (j > i && sum + f > budget) break; // chunk เดียวอย่างน้อย 1 input line เสมอ (line ยาวผิดปกติ = ยอม degrade)
+          sum += f; j++;
+        }
+        sc.write(lines.slice(i, j).join('\r\n') + '\r\n', () => {
+          try {
+            const sb = sc._core._bufferService.buffer; // no-scroll โดย construction: y = จำนวนแถว content (ทิ้ง blank หลัง \n สุดท้ายเอง)
+            for (let k = 0; k < sb.y; k++) { const ln = sb.lines.get(k); if (ln) fresh.push(ln); }
+            sc.reset();
+            i = j;
+            if (i < lines.length) { step(); return; }
+            injectLines(b, fresh);
+          } catch (e) { try { sc.dispose(); } catch (e2) {} scratch = null; }
+        });
+      };
+      step();
+    } catch (e) {}
+  };
+
+  let scratch = null;
+  function scratchTerm(cols) {
+    if (scratch && scratch.cols !== cols) { try { scratch.dispose(); } catch (e) {} scratch = null; }
+    if (!scratch) {
+      // rows 512/scrollback 0 = scratch เป็น "กระดาษ no-scroll" ล้วน (history ไม่ใช่หน้าที่มัน — ดู isWrapped trap ข้างบน)
+      scratch = new Terminal({ cols: cols, rows: 512, scrollback: 0, allowProposedApi: true });
+      const UA = window.Unicode11Addon && window.Unicode11Addon.Unicode11Addon; // ตารางกว้าง ≡ live + :engine (round 15 rule)
+      if (UA) { scratch.loadAddon(new UA()); scratch.unicode.activeVersion = '11'; }
+    }
+    return scratch;
+  }
+
+  // CircularList surgery: เลื่อน _startIndex (O(kept), ไม่มี head-shift) — overflow = ทิ้งของเก่าสุดฝั่ง
+  // incoming ก่อน (visible/viewport ห้ามโดนกระทบ — F-1 hard bound เดิมของ scrollback)
+  function injectLines(b, fresh) {
+    const L = b.lines, M = L._maxLength, len = L._length;
+    const evict = Math.max(0, fresh.length + len - M);
+    const items = evict > 0 ? fresh.slice(evict) : fresh;
+    const kept = items.length;
+    if (!kept) return;
+    L._startIndex = ((L._startIndex - kept) % M + M) % M;
+    for (let i = 0; i < kept; i++) L._array[(L._startIndex + i) % M] = items[i];
+    L._length = len + kept;
+    for (const m of b.markers) m.line += kept;
+    b.ybase += kept;
+    b.ydisp += kept; // content-lock ≡ native shiftForPrepend: user เห็น content เดิม, ของใหม่อยู่เหนือให้ปัดต่อ
+    term.refresh(0, term.rows - 1);
+    const vp = term._core._viewport || term._core.viewport;
+    if (vp && vp.syncScrollPosition) { try { vp.syncScrollPosition(); } catch (e) {} }
+  }
+})();
 
 term.writeln('A-Terminal — connecting…'); // boot marker: ทุก asset test ต้องเห็นข้อความนี้ก่อน = ไฟล์ใหม่จริง (บทเรียน cache poisoning round 3)
 term.focus();

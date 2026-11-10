@@ -94,4 +94,12 @@ class TmuxCapabilities(val version: TmuxVersion) {
 
     /** theme options + new layouts — 3.8 (ยังไม่ release: เปิดเฉพาะ git build `next-3.8`) */
     val themeOptions get() = version.atLeast(3, 8)
+
+    /**
+     * literal TAB ใน `-F` arg คงอยู่ถึง output (pane tail = command<TAB>path)
+     * lab 2026-11-06 (od -c, iso socket + container): **3.6 = TAB ผ่าน, 3.4 = ได้ `_` แทน**
+     * (tmux client ประกอบ command string ข้าม wire — escaping ของ tab ต่างกันระหว่างสองเวอร์ชันที่วัดได้)
+     * 3.5 ยังไม่ได้วัด → gate ที่ 3.6 (ขอบที่พิสูจน์แล้วฝั่งผ่านเท่านั้น — conservative)
+     */
+    val tabInFormatSafe get() = version.atLeast(3, 6)
 }

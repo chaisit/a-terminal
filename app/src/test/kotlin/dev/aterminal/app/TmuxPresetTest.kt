@@ -20,12 +20,42 @@ class TmuxPresetTest {
     }
 
     @Test
-    fun `future alert hooks ship commented so pasting today is valid config`() {
+    fun `alert section ships live with the lab-verified form-Z bell hook`() {
         val s = TmuxPreset.snippet
-        // ทุกบรรทัด non-empty ต้อง valid หรือ comment — comment ของ 07 ต้องนำด้วย #
-        s.lines().filter { it.isNotBlank() && !it.trim().startsWith("#") }
-            .forEach { assertTrue("บรรทัด active ต้องเป็น set -g: $it", it.startsWith("set -g ")) }
-        assertTrue("ต้องมี section 07 แบบ comment", s.contains("# alert"))
+        // form Z = formเดียวที่ผ่าน config-file parser ของ tmux (lab 11-06, วัด payload จริง `bell|alert-test|bash` บน 3.4)
+        val hook = "set-hook -ag alert-bell 'run-shell \"tmux set -g @atm_alert \\\"bell|#S|#W\\\"; tmux wait-for -S ATMALERT\"'"
+        assertTrue("ขาด hook line form Z:\n$s", s.contains(hook))
+        // monitor-bell off บน window ปัจจุบัน = hook ไม่ยิง (วัด lab) — ต้อง open global
+        assertTrue(s, s.contains("set -gw monitor-bell on"))
+        assertTrue(s, s.contains("set -g bell-action any"))
+        // channel/option ใน hook ต้องตรงกับที่ app wait — drift = notifications ตายเงียบ
+        assertTrue(s, s.contains(dev.aterminal.core.TmuxAlerts.CHANNEL))
+        assertTrue(s, s.contains(dev.aterminal.core.TmuxAlerts.PAYLOAD_OPTION))
+        // placeholder แบบ comment เดิมต้องหายหมด (user อย่าได้ chance เข้าใจว่า feature ยังไม่เปิด)
+        org.junit.Assert.assertFalse("ยังเหลือ placeholder เก่า", s.contains("uncomment when A-Terminal"))
+    }
+
+    @Test
+    fun `clipboard section enables OSC 52 forwarding (user approved both lines 11-07)`() {
+        val s = TmuxPreset.snippet
+        // วัด lab 11-07: `set-clipboard` default = external → pane OSC 52 ถูก tmux ทิ้งทั้งก้อน
+        // ต้อง `on` เท่านั้นถึง forward ออกมาหา app (3.4/3.6 เหมือนกัน)
+        assertTrue(s, s.contains("set -s set-clipboard on"))
+        // terminal-features มี default `xterm*:clipboard` แล้วบน ≥3.4 แต่ `on` ยังต้อง TTYC_MS —
+        // ใส่ -as (append ไม่ใช่ replace) ให้ coverage กับ terminfo/server ที่ไม่มี glob นั้น
+        assertTrue(s, s.contains("set -as terminal-features 'xterm*:clipboard'"))
+    }
+
+    @Test
+    fun `every snippet line is blank, a comment, or a live tmux statement`() {
+        // snippet = artifact ที่ user paste ตรง — syntax ผิดบรรทัดเดียว = conf พังทั้งไฟล์
+        TmuxPreset.snippet.lines().filter { it.isNotBlank() && !it.trim().startsWith("#") }
+            .forEach {
+                assertTrue("บรรทัด active ไม่รู้จัก: $it",
+                    it.startsWith("set -g ") || it.startsWith("set -gw ") ||
+                        it.startsWith("set -s ") || it.startsWith("set -as ") ||
+                        it.startsWith("set-hook "))
+            }
     }
 
     @Test

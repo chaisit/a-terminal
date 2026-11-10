@@ -33,6 +33,15 @@ class ScrollState {
     /** baseY เปลี่ยนจาก resize/reflow (ทั้งโตและหด) — clamp อย่างเดียว ไม่ follow */
     fun clamp(baseY: Int) { top = top.coerceIn(0, baseY) }
 
+    /**
+     * tmux/08: inject ประวัติ k บรรทัดเข้าหัว (TerminalEngine.prependHistory คืนค่านี้) —
+     * content เดิมทุก index เลื่อนลง k → top เลื่อนตาม = user ยังจ้อง content เดิม (content-lock)
+     * tail-sticky ก็ตาม tail ใหม่เหมือนกัน (screen ไม่เปลี่ยนเนื้อหา, baseY โต)
+     */
+    fun shiftForPrepend(k: Int, baseY: Int) {
+        if (k > 0) top = (top + k).coerceIn(0, baseY)
+    }
+
     /** delta > 0 = ดูใหม่ขึ้น (ลง toward bottom), < 0 = ดูเก่าขึ้น (scrollback) */
     fun scrollBy(delta: Int, baseY: Int) { top = (top + delta).coerceIn(0, baseY) }
 

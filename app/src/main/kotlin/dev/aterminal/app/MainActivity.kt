@@ -56,7 +56,10 @@ import dev.aterminal.core.SettingsLoader
 import dev.aterminal.core.SettingsSync
 import dev.aterminal.core.StartupArgs
 import dev.aterminal.core.TerminalBackend
+import dev.aterminal.core.OscClipboard
 import dev.aterminal.core.Scheme
+import dev.aterminal.core.TerminalReports
+import dev.aterminal.core.paletteColor
 import dev.aterminal.engine.TerminalEngine
 import dev.aterminal.render.Palette
 import dev.aterminal.render.TerminalView
@@ -65,7 +68,9 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONObject
 
 /**
@@ -86,6 +91,7 @@ class MainActivity : ComponentActivity() {
     internal lateinit var secrets: SecretsStore
     internal lateinit var connectUi: ConnectUi
     internal lateinit var settingsUi: SettingsUi
+    internal val tmuxBrowserUi by lazy { TmuxBrowserUi(this) } // tmux/06: touch session/window/pane browser
     private var settingsWatcher: SettingsWatcher? = null
     private var lastSettingsHash: String? = null   // กัน watcher reload ไฟล์ที่เพิ่ง persistSettings เอง
     // round 7: ตาราง keybinding ที่ resolve+normalize แล้ว (grammar อยู่ core — D1); JS แค่ lookup
@@ -112,6 +118,7 @@ class MainActivity : ComponentActivity() {
     private val debugImeLog by lazy { (applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0 }
     private lateinit var termContainer: FrameLayout
     private lateinit var tabBar: ComposeView
+    private lateinit var windowStripView: ComposeView // tmux/09: แถว window pills (ใต้ tabBar, เหนือ termContainer)
     // round 21: keys-bar modifier (CTRL/⇧) — ตัวเดียวทั้ง activity, แปลง input ทุกทางของ active pane
     private val mods = KeyModifierState()
     // ticket tmux/05: prefix-pending state (singleton ตาม mods — pending ตัวเดียว ≡ นิ้วจริง)
@@ -136,10 +143,18 @@ class MainActivity : ComponentActivity() {
     private var statusSnap by mutableStateOf("≡ new tab — tap to connect" to 0xFF9A9A9AL)
     // ค่า boot อ่านจาก default ของ Settings เอง — ห้าม hardcode ค่าที่สอง (เคย stale พร้อมกันสองที่รอบ 17)
     private var barSnap by mutableStateOf(TopBarSnapshot(emptyList(), null, false, "webview", true, Settings().imeSuggestions))
+    // tmux/09: snapshot ของ window strip (แถว 2) — เขียนจาก host ของ pane ที่ focus เท่านั้น (stripPane)
+    private var windowStripSnap by mutableStateOf<List<dev.aterminal.core.WindowStrip.Window>>(emptyList())
+    private var stripPane: TerminalSession? = null // pane ที่ stripปัจจุบัน belong — syncStripFocus เป็นผู้ย้าย
 
     // round 23 amendment (Update Check, GLOSSARY §Distribution)
     private var appVersion: String = "?" // versionName ดิบ — CrashLog pattern เดียว (packageManager, ไม่ใช่ BuildConfig)
     private var pendingUpdate: List<UpdateCheck.Release>? = null // ผล auto ที่มาตอน background → show ตอน onResume (Q11)
+    // tmux/07: notification id ต่อตัว (พื้น 1000 กันชน id ของ FGS=1) — seed ตามเวลา: counter เริ่ม 1001 ใหม่ทุก
+    // process restart = alert แรกหลัง process ตายไปทับ (notify ด้วย id เดิม) notification เก่าที่ user ยังไม่แตะ (spec review 11-07)
+    private var alertNotifyId = 1_000 + (System.currentTimeMillis() / 1_000 % 90_000).toInt()
+    // tmux/07: cold-start tap = เก็บ target ไว้ dial หลัง resume รอบแรก (วัด device 11-07: dial ตอนปลาย onCreate = pane ค้าง "connecting…" ไม่มี socket)
+    private var pendingAlertLaunch: Pair<String?, String?>? = null
     private var updateCheckInFlight = false // กัน double-tap ⋮ = สอง dialog
     private var updateCheckManualQueued = false // F2: manual ซ้อนตอน in-flight = ตอบแบบ manual เมื่อผลกลับ
 
@@ -151,6 +166,7 @@ class MainActivity : ComponentActivity() {
         val engine: String,
         val updateChecks: Boolean, // round 23 amendment: label สวิตช์ 🌐 ใน ⋮ (F8: ไม่มี default — source of truth เดียว = Settings ผ่าน refreshTabs)
         val imeSuggestions: String, // HW 11-05: ค่า settings ดิบ (label สั้นที่ ImeSuggestions.short — menu ห้ามมี logic)
+        val historyAvailable: Boolean = false, // tmux/08b: 🕘 ใน ⋮ โผล่เมื่อ active pane มี historySource (probe-armed)
         // task 9: สี chrome ตาม scheme ของ pane active — คำนวณครั้งเดียวต่อ snapshot (ChromePalette)
         // ค่า default = fallback ตอน boot ก่อน pane แรก (≡ สี hard-code ยุค task 7)
         val chrome: ChromeColors = ChromeColors(),
@@ -170,6 +186,7 @@ class MainActivity : ComponentActivity() {
     private var imm: InputMethodManager? = null
     @Volatile private var lastCopiedByApp: String? = null   // กัน clipboard listener paste กลับสิ่งที่ copy จาก terminal
     @Volatile private var lastSetClip: String? = null       // fallback เมื่อ system clip โดนล้าง (ดู armClipboard)
+    @Volatile private var uiResumed = false                 // ticket 03: gate การอ่าน clipboard ตอบ OSC52 query (privacy: foreground only)
     private var clipListener: ClipboardManager.OnPrimaryClipChangedListener? = null
     private var lastClipTimestamp: Long? = null
 
@@ -287,6 +304,8 @@ class MainActivity : ComponentActivity() {
                     appVersion = appVersion, // static ต่อ process — ไม่อยู่ใน snapshot ก็ได้ (ไม่ recompose ต้องการ)
                     statusText = statusSnap.first,
                     statusColor = androidx.compose.ui.graphics.Color(statusSnap.second),
+                    historyAvailable = barSnap.historyAvailable, // tmux/08b: 🕘 ใน ⋮ (flag เดียวกับ puller ที่ arm แล้ว)
+                    onOpenHistory = { openHistoryOverlay() },
                     onClose = { closeTab(it) },
                     onMenu = { showPaneMenu(it) },
                     onBeforeMenu = { closeImeForMenus() }, // task 10: ∨/⋮ ก็เป็น menu — ปิด IME ก่อนเหมือนกัน
@@ -294,6 +313,15 @@ class MainActivity : ComponentActivity() {
             }
         }
         root.addView(tabBar, LinearLayout.LayoutParams(-1, LinearLayout.LayoutParams.WRAP_CONTENT))
+        // tmux/09: แถว window pills (user ruling 11-08: แถวที่ 2 เฉพาะตอน control session มีข้อมูล — ว่าง = zero height, chrome เดิมเป๊ะ)
+        windowStripView = ComposeView(this).apply {
+            isFocusable = false
+            isFocusableInTouchMode = false
+            setContent {
+                ATerminalWindowStrip(windowStripSnap, barSnap.chrome) { id -> stripPane?.stripHost?.select(id) }
+            }
+        }
+        root.addView(windowStripView, LinearLayout.LayoutParams(-1, LinearLayout.LayoutParams.WRAP_CONTENT))
         // task 7: status strip (TextView + A−/A+/⚡) ถูกลบ — gesture เดิมย้ายเข้า top bar (statusTap/statusLongPress),
         // action ของปุ่ม(strip) → ⋮ overflow (runOverflow)
         // ⚡ paste = ปุ่ม KeyKind.app ใน KeyPresets.default/compact (ตำแหน่ง 4 หลัง ⌃C — fix wave 1 เพิ่ม; task 7
@@ -388,6 +416,17 @@ class MainActivity : ComponentActivity() {
             openTab() // boot: tab ว่างตัวแรก — onPageFinished จะเปิด profile list เอง
         }
         showPendingCrashReport()
+        // tmux/07: process ตายก่อน tap (กรณีปกติ — FGS ก็ตายไปก่อนแล้ว) = intent เข้า onCreate ไม่ใช่ onNewIntent —
+        // อ่าน getIntent() รอบเดียวตอนท้าย (settings/manager พร้อมแล้ว) แล้วล้าง action กัน recreate ยิงซ้ำ
+        val bootIntent = intent
+        if (bootIntent?.action == ACTION_TMUX_ALERT) {
+            bootIntent.action = null
+            pendingAlertLaunch = Pair(
+                bootIntent.getStringExtra(EXTRA_ALERT_PROFILE),
+                bootIntent.getStringExtra(EXTRA_ALERT_SESSION_ID),
+            )
+            ConnectionLog.d("alert boot: captured target guid=${pendingAlertLaunch?.first?.take(8)} sid=${pendingAlertLaunch?.second}")
+        }
     }
 
     /** report จากการปิดตัวครั้งก่อน: แสดงครั้งเดียว ให้ user เลือกคัดลอกเอง (ไม่ส่งออกจากเครื่อง) */
@@ -422,9 +461,26 @@ class MainActivity : ComponentActivity() {
         syncKeepAlive() // service ที่เริ่มจาก background ไม่ได้ (เช่น reconnect) เริ่มตรงนี้
     }
 
+    /** tmux/07: tap notification = intent เดียวกับ instance เดิม (singleTask — session ไม่ recreate) */
+    override fun onNewIntent(intent: android.content.Intent) {
+        super.onNewIntent(intent)
+        if (intent.action == ACTION_TMUX_ALERT) {
+            setIntent(intent)
+            openAlertTarget(intent.getStringExtra(EXTRA_ALERT_PROFILE), intent.getStringExtra(EXTRA_ALERT_SESSION_ID))
+            intent.action = null // onCreate บน recreation ถัดไปห้ามเห็น alert intent ซ้ำ (กัน dial/switch ซ้อน)
+        }
+    }
+
     override fun onResume() {
         super.onResume()
+        uiResumed = true
         ConnectionLog.d("activity onResume")
+        // tmux/07: cold-start tap — dial ถูก deferred มาจาก onCreate (pane/window พร้อมกว่านี้ไม่ได้แล้ว)
+        pendingAlertLaunch?.let { (guid, sid) ->
+            pendingAlertLaunch = null
+            ConnectionLog.d("alert boot: dial guid=${guid?.take(8)} sid=$sid")
+            openAlertTarget(guid, sid)
+        }
         // Q11: auto notice ที่ผลกลับตอน background = เด้งทันทีที่ foreground (pending ใน memory เท่านั้น —
         // process ตายก่อน show = ไม่ mark dismissed, throttle 24h ผ่านแล้วจะเช็คเจอใหม่ = delay ไม่ใช่ของหาย)
         // F5: อ่าน opt-out ตอน show — toggle Off ระหว่าง fetch = ต้องไม่ฝืนเด้ง
@@ -437,6 +493,7 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onPause() {
+        uiResumed = false // ticket 03: ห้ามอ่าน clipboard ตอบ query ตั้งแต่จังหวะนี้ (runOnUiThread ที่ค้างคิวจะเจอ flag นี้)
         ConnectionLog.d("activity onPause finishing=$isFinishing")
         super.onPause()
     }
@@ -583,6 +640,9 @@ class MainActivity : ComponentActivity() {
      * closeImeIfSneaked (ปิดวาล์ว → hide → restartInput) กัน vendor stack จำ viewClicked แล้ว reopen
      */
     private fun toggleKeyboard() {
+        // tmux/08b H1 (Honor 11-10): overlay ที่เปิดอยู่ = read-only menu surface — ⌨ ห้ามปลด editor
+        // ของ pane ข้างล่าง (revealIme คือทางเดียวที่ IME เกิด — ปิดทางนี้ = ปิด leak ทั้งเส้น)
+        if (overlayHoldsInput()) return
         // fix tmux/05 (E2E 11-05): Chromium สร้าง surrogate EditText ของมันเอง *ภายใน* ImeGateWebView
         // เพื่อถือ InputConnection (เห็นเป็น [focused] ทั้งใน a11y tree) — ตรวจหยาบ ๆ "currentFocus is
         // EditText" จึงกลืน surrogate = ⌨ ตายทั้งปุ่มหลัง focus restore (emulator วัดจริง) —
@@ -883,6 +943,25 @@ class MainActivity : ComponentActivity() {
     private fun activeTab(): TerminalTab<TerminalSession>? = manager.active()
     private fun activePane(): TerminalSession? = activeTab()?.focusedPane()
 
+    /**
+     * tmux/09: ผู้ดูแล focus policy ของ control session (user ruling 11-08: เปิดเฉพาะ tab ที่ focus, ≤1 ตัวทั้งเครื่อง)
+     * refreshTabs เรียกเสมอ — identity ของ focused pane ไม่เปลี่ยน = no-op (hot path: ACTION_DOWN ก็เรียก refreshTabs)
+     */
+    /** invariant เดียวของ "ย้าย strip": stop host ตัวเก่า + ย้าย stripPane + clear snapshot (สอง caller ห้าม copy shape นี้คนละแบบ) */
+    private fun detachStrip(newPane: TerminalSession?) {
+        stripPane?.stripHost?.stop()
+        stripPane = newPane
+        windowStripSnap = emptyList() // clear ทันที — snapshot ของ pane เก่าห้ามค้างบน chrome ของ pane ใหม่
+    }
+
+    private fun syncStripFocus() {
+        val cur = activePane()
+        if (cur === stripPane) return
+        detachStrip(cur)
+        val h = cur?.stripHost
+        if (h != null) lifecycleScope.launch { h.start() }
+    }
+
     private fun tabIdOf(s: TerminalSession): Long? {
         for (id in manager.ids()) manager.get(id)?.let { if (it.indexOf(s) >= 0) return id }
         return null
@@ -1063,14 +1142,17 @@ class MainActivity : ComponentActivity() {
         )
         tv.onFeed = { bytes -> s.controller.write(bytes) }
         tv.onCopy = { text -> copyTextToClipboard(text) } // T2: selection copy ≡ Droid.copyToClipboard ฝั่ง webview
+        tv.onReachTop = { requestHistoryPull(s) } // tmux/08: user gesture ชนขอบบน = pull หนึ่งหน้า (fail-soft ใน puller)
         tv.keymap = keyTable // T4
         tv.onAppAction = { runAction(it) } // chord APP-target ≡ Droid.onAction → runAction เดิม (fail-soft toast ในนั้น)
         tv.onGridResize = { c, r ->
+            s.historyGen++ // tmux/08: engine.resize (reflow scrollback) เกิดที่ view ก่อน callback นี้ — anchor เก่า invalid
             // round 23 T5 permanent diagnostic: grid vs pty on every resize — a real device can settle
             // the field hypothesis "pty was told cols > grid" (tmux SIGWINCH race) from `adb logcat -s AtermResize`
             Log.i("AtermResize", "native grid ${c}x${r} pty ${s.cols}x${s.rows}")
             s.cols = c; s.rows = r
             s.controller.resize(c, r)
+            s.stripHost?.resize(c, r) // tmux/09: control client ไม่เห็น PTY resize — ต้องบอก -C เอง (spike fact 13)
             runOnUiThread {
                 // review fix (task 7): TabInfo.cols/rows + header "name (W×H)" เป็น snapshot —
                 // ทุก writer ของ s.cols/s.rows ต้อง refreshTabs ด้วย (resize ไม่ใช่ hot-path)
@@ -1089,12 +1171,13 @@ class MainActivity : ComponentActivity() {
         return s
     }
 
-    /** palette จาก settings (lookup เดียวกับ colorSchemeJson ของ bridge — ห้ามหลุดกันสองทาง) */
-    private fun paletteFor(p: Profile?): Palette {
-        val scheme = settings.schemes.firstOrNull { it.name == (p?.colorScheme ?: "Campbell") }
+    /** lookup scheme เดียวทุก path (paletteFor / schemeFor / colorSchemeJson ต้องตรงกัน — ห้ามหลุดทางใดทางหนึ่ง) */
+    private fun schemeForProfile(p: Profile?): Scheme =
+        settings.schemes.firstOrNull { it.name == (p?.colorScheme ?: "Campbell") }
             ?: Scheme(name = "Campbell")
-        return Palette.fromScheme(scheme)
-    }
+
+    /** palette จาก settings (lookup เดียวกับ colorSchemeJson ของ bridge — ห้ามหลุดกันสองทาง) */
+    private fun paletteFor(p: Profile?): Palette = Palette.fromScheme(schemeForProfile(p))
 
     /** size view ปัจจุบัน (sp→px) — path native อย่างเดียว */
     private fun configureNative(s: TerminalSession, fontFace: String?) {
@@ -1208,6 +1291,9 @@ class MainActivity : ComponentActivity() {
      * routeKey คืนทางเดิมเมื่อ mode ปิด — ExtraKeysBar/MiniKeysBar internals ไม่โดนแตะ (seam lambda เดิม)
      */
     private fun routeKey(key: String) {
+        // tmux/08b H1: overlay เปิดอยู่ = read-only — bytes จาก bar (⌃C, arrows, tmux keys) และ
+        // "app:paste" ห้ามแตะ shell (guard เดียวกับ ⌨ — gate test: OverlayInputGuardTest)
+        if (overlayHoldsInput()) return
         // ADR 0002 task 4: ปุ่ม app-kind ของ bar = sentinel "app:<id>" — ต้องเบรก *ก่อน* mods.transform
         // (transform fail-soft กับ multi-char = "app:paste" จะถูกพิมพ์ลง PTY ตรง ๆ ถ้าหลุดผ่าน)
         if (key.startsWith(ExtraKeysBar.APP_ACTION_PREFIX)) {
@@ -1510,6 +1596,10 @@ class MainActivity : ComponentActivity() {
             if (s?.native == true) (s.view as? TerminalView)?.toggleMark() // T7 native path
             else s?.js("window.AtermKeys && AtermKeys.toggle();")
         }
+        // tmux/06: touch choose-tree — ซ่อน entry เมื่อ backend ไม่มี tmux (capability จาก 02: null = fail-soft)
+        if (activePane()?.controller?.activeBackend?.tmuxCapabilities != null) {
+            items += "≣  tmux sessions…" to { activePane()?.let { tmuxBrowserUi.open(it) } }
+        }
         // review fix (task 7): single-tab ไม่มี long-press บน status text แล้ว — "stop auto-reconnect"
         // ของ strip เดิมจึงมาเป็น item เฉพาะตอน pane นี้กำลัง countdown (body เดียวกับ statusLongPress)
         val foc = tab.focusedPane()
@@ -1562,6 +1652,7 @@ class MainActivity : ComponentActivity() {
 
     private fun disposeSession(s: TerminalSession) {
         cancelReconnect(s) // T3: คิว dial ห้ามรอดไป connect pane ที่ตายแล้ว
+        cancelAlertWatch(s) // tmux/07: waiter ของ pane ตายพร้อม pane
         runCatching { (s.view.parent as? ViewGroup)?.removeView(s.view) }
         markOn.remove(s)   // round 7: pane ตายตอน markMode on = อย่าค้าง set (กัน routeKey ส่งเข้า WebView ที่ destroy)
         s.controller.close()
@@ -1648,6 +1739,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun refreshTabs() {
+        syncStripFocus() // tmux/09: focus เปลี่ยน (tab/pane/split) = ย้าย control session — refreshTabs คือ choke point เดียวที่ทุก path วิ่งผ่าน
         tabSnap = manager.ids().mapNotNull { id ->
             val tab = manager.get(id) ?: return@mapNotNull null
             val foc = tab.focusedPane()
@@ -1683,8 +1775,11 @@ class MainActivity : ComponentActivity() {
             engine = settings.engine,
             updateChecks = settings.updateChecks,
             imeSuggestions = settings.imeSuggestions,
+            historyAvailable = activePane()?.historySource != null, // 08b (single writer เดียวกับ snapshot เดิม)
             chrome = ChromePalette.from(pal.defaultBg, pal.defaultFg),
         )
+        // 08b: tab สลับ/ปิด = overlay (ของ pane เก่า) ต้องปิดตาม — กันดู history ผิด pane
+        if (historyOverlay != null && historyOverlaySession?.let { tabIdOf(it) } != manager.activeId) closeHistoryOverlay()
         applyChrome(barSnap.chrome)
         window.decorView.keepScreenOn = tabViews.values.any { tv ->
             tv.slots.any { it?.controller?.state == SessionController.State.CONNECTED }
@@ -1974,6 +2069,7 @@ class MainActivity : ComponentActivity() {
     private fun disconnectAllSessions() {
         for (tv in tabViews.values) for (p in tv.slots) p?.let {
             cancelReconnect(it)
+            cancelAlertWatch(it) // tmux/07: "ปิดทุก session" ต้องรวม waiter
             it.controller.close()
             it.everConnected = false // user ตัดเอง: เปิดแอปครั้งหน้าห้ามต่อกลับอัตโนมัติ
         }
@@ -2001,6 +2097,7 @@ class MainActivity : ComponentActivity() {
             }
             SessionController.State.IDLE -> cancelReconnect(s) // close()/retry ของ user = คิวเก่ายกเลิก
             SessionController.State.DISCONNECTED -> {
+                cancelAlertWatch(s) // tmux/07: connection ตาย = waiter เก่าหมดความหมาย (dial ใหม่ arm เองหลัง probe)
                 // จำผิดไว้ = ถามใหม่ไม่ได้อีกเลย จึงลืมเฉพาะกรณีนี้ แตะ status bar แล้วจะถามใหม่
                 if (s.controller.lastError?.code == BackendError.Code.KEY_PASSPHRASE) s.profile?.keyAlias?.let { secrets.setKeyPassphrase(it, null) }
                 // re-pin (round 16): mismatch จาก manual dial = ผู้ใช้ยืนรอคำตอบอยู่ — เสนอยืนยัน fingerprint ใหม่
@@ -2111,9 +2208,12 @@ class MainActivity : ComponentActivity() {
             if (s.engine == null) {
                 val tv = s.view as TerminalView
                 s.engine = TerminalEngine(tv.gridCols, tv.gridRows, p.historySize).also { tv.attachEngine(it) }
-                // tmux/04: native twin ของ term.onTitleChange — engine มี onOsc มาแต่ round 9, ตรงนี้คือ consumer ตัวแรก
-                // (OSC 0 = icon+title, 2 = title ≡ xterm; code อื่น ignore — gate sanitize+debounce ให้เอง)
-                s.engine?.onOsc = { code, text -> if (code == 0 || code == 2) noteTerminalTitle(s, text) }
+                s.historyGen++ // tmux/08: engine/buffer ใหม่ = anchor ทั้งหมดของ puller เก่า invalid
+                // tmux/04: native twin ของ term.onTitleChange — engine มี onOsc มาแต่ round 9
+                // tmux/03 ต่อ: consumer รับครบ title + OSC52 + colour queries (dispatcher = routeNativeOsc)
+                s.engine?.onOsc = { code, text -> routeNativeOsc(s, code, text) }
+                // tmux/03: คำตอบ query (DA1/DA2/DSR) ที่ engine สร้าง ต้องถึง pty — wiring ตัวแรกที่เคยหลุด
+                s.engine?.onResponse = { resp -> s.controller.write(resp) }
                 s.cols = tv.gridCols; s.rows = tv.gridRows
                 s.view.postInvalidate()
             }
@@ -2312,8 +2412,258 @@ class MainActivity : ComponentActivity() {
                 if (s.native) s.engine?.write(byteArrayOf(0x1b, 0x63)) else s.js("window.term && term.reset();")
             }
         }
+        // tmux/07: ตั้งผู้ฟัง probe ก่อน dial — probe สำเร็จ (caps != null) ค่อย arm alert watcher (ห้าม arm blind)
+        backend.onTmuxProbe = { caps ->
+            runOnUiThread { // listener ยิงจาก probe thread
+                s.alertJob?.cancel()
+                s.alertJob = null
+                if (caps != null && (p.type == "ssh" || p.type == "termux")) {
+                    s.alertJob = lifecycleScope.launch {
+                        TmuxAlertWatcher(
+                            backend,
+                            onAlert = { alert -> handleTmuxAlert(s, backend, p, alert) },
+                            onWarn = { ConnectionLog.d("tmux alert watcher: $it") }, // §Threading: swallow ของ watcher ต้องลง log
+                        ).run()
+                    }
+                    // tmux/08: gesture at top-edge อนุญาตเมื่อ probe ยืนยันว่ามี tmux เท่านั้น (gate เดียวกับ 07 — ห้าม arm blind)
+                    s.historyPuller = HistoryPuller(
+                        backend = backend,
+                        target = { dev.aterminal.core.TmuxHistory.sessionFromCommandline(p.commandline ?: "") }, // custom cmdline = null = server-current
+                        appDepths = { historyDepths(s) },
+                        generation = { s.historyGen },
+                        onInject = { lines -> injectHistoryPage(s, lines) },
+                        onStatus = { loading -> if (loading) toast("Loading history…") },
+                        onWarn = { ConnectionLog.d("tmux history: $it") },
+                    )
+                    // tmux/08b: overlay ใช้ source เดียวกัน (probe-armed เท่านั้น — affordance ใน ⋮ ดู flag นี้)
+                    s.historySource = HistorySource(
+                        backend = backend,
+                        target = { dev.aterminal.core.TmuxHistory.sessionFromCommandline(p.commandline ?: "") },
+                    )
+                    // tmux/09: host window strip — probe-armed เหมือน 07/08b แต่ start เมื่อ pane นี้ *ถูก focus* เท่านั้น
+                    // (target เดียวกับ history: cmdline ต้องระบุ session ชัด — fail-soft เงียบถ้าไม่มี; ≤1 ตัวทั้งเครื่องโดยโครงสร้าง)
+                    s.stripHost = WindowStripHost(
+                        open = { cmd, c, r -> backend.openControlTransport(cmd, c, r) },
+                        target = { dev.aterminal.core.TmuxHistory.sessionFromCommandline(p.commandline ?: "") },
+                        size = { s.cols to s.rows },
+                        onWindows = { list ->
+                            runOnUiThread { if (activePane() === s) windowStripSnap = list } // stale pane = ทิ้ง
+                        },
+                        onWarn = { ConnectionLog.d("tmux strip: $it") },
+                    )
+                    if (activePane() === s) lifecycleScope.launch { s.stripHost?.start() }
+                } else {
+                    s.historyPuller = null
+                    s.historySource = null
+                    s.stripHost = null
+                }
+            }
+        }
         // pane ใหม่: user tap เร็วกว่า loadUrl จบ ได้ — อย่าทิ้ง bytes แรกของ backend (round 4 bug)
         if (s.pageReady) go() else s.pendingConnect = go
+    }
+
+    /** tmux/07: pane ตาย/disconnect = ปิด waiter (watcher retry บน connection ที่ปิดแล้ว = timer เปล่า ๆ ห้ามคงอยู่)
+     *  tmux/08: puller ตายพร้อม backend เดียวกัน — dial ใหม่ arm หลัง probe เอง */
+    private fun cancelAlertWatch(s: TerminalSession) {
+        s.alertJob?.cancel()
+        s.alertJob = null
+        s.historyPuller = null
+        s.historySource = null
+        if (historyOverlaySession === s) closeHistoryOverlay() // 08b: session ตาย = overlay ของมันต้องปิดตาม
+        // tmux/09: control session ต้องตายพร้อม backend เดียวกัน (connection ปิด = channel ปิดตามอยู่แล้ว — stop เพื่อ clear snapshot ทันที)
+        if (stripPane === s) detachStrip(null) // host ของ stripPane ถูก stop ใน helper แล้ว
+        s.stripHost?.stop() // idempotent — ครอบคลุม host ของ pane ที่ไม่ได้ focus ด้วย
+        s.stripHost = null
+    }
+
+    /**
+     * tmux/08: caller ที่ขอบบน (native onReachTop / webview Droid.historyEdge) —
+     * puller ไม่ถูก arm (echo / probe ไม่เจอ tmux) หรือ pull ก่อนหน้ายังแล่น = drop เงียบ ๆ
+     * (cmdline custom ยัง arm — แค่ target=null = server-current)
+     */
+    private fun requestHistoryPull(s: TerminalSession) {
+        val puller = s.historyPuller ?: return
+        lifecycleScope.launch { puller.pull() } // main-thread contract (busy flag ของ puller ไม่ synchronize)
+    }
+
+    // ---- tmux/08b: history overlay (read-only, b1) ----
+    private var historyOverlay: HistoryOverlay? = null
+    private var historyOverlaySession: TerminalSession? = null
+
+    /**
+     * H1 (Honor 11-10, build 0.5.13): overlay เป็น read-only ด้วย requestFocus() อย่างเดียว — ซึ่ง
+     * ไม่กัน IME ที่ focus ค้างใน WebView (Gboard commit เข้า view ที่ focus ไม่ใช่ view ที่มองเห็น)
+     * และ ไม่กัน bytes จาก keys bar — policy ที่แท้จริง: overlay เปิด = menu surface, ทุก funnel
+     * (toggleKeyboard/routeKey) yield ด้วย gate นี้; BT keyboard = known-gap เดียวกับเมนูทั้ง app
+     */
+    private fun overlayHoldsInput(): Boolean = historyOverlay != null
+
+    private fun closeHistoryOverlay() {
+        historyOverlay?.close()
+        historyOverlay = null
+        historyOverlaySession = null
+    }
+
+    /**
+     * เปิด overlay ของ pane active (⋮ → 🕘 — affordance มีได้เฉพาะ puller-armed)
+     * overlay ใหม่ทุกครั้งที่เปิด (depth เริ่ม 0 = หน้าแรกคือ tail ของ history เสมอ);
+     * หนึ่ง OverlayPager ต่อ overlay (instance เดียวข้าม gesture — delivered สะสมจริง; fresh ต่อ pull =
+     * ทุก gesture re-fetch page 1 แล้ว re-prepend = device bug 11-08 ที่เจอตอน matrix)
+     * instance ใหม่ต่อ open = pageSize/ratio ของ live path ไม่ sticky ข้าม window (ตามเจตนาเดิม)
+     */
+    private fun openHistoryOverlay() {
+        // menu policy ของตัวเอง (H1): ปิด IME + ปิดวาล์วทุก pane ณ เปิด — ไม่พึ่ง onBeforeMenu ของ ⋮
+        // ทางเดียว (caller อนาคต/ path อื่นต้องได้ policy เท่ากัน); idempotent กับ ⋮ ที่ยิงมาก่อนแล้ว
+        closeImeForMenus()
+        val s = activePane() ?: return
+        val src = s.historySource ?: return
+        val ov = HistoryOverlay(host = this, container = termContainer, chrome = barSnap.chrome)
+        ov.setTitle("tmux history — ${src.target() ?: "server"}")
+        val previous = historyOverlay
+        historyOverlay = ov
+        historyOverlaySession = s
+        previous?.close()
+        ov.open()
+        val pageId = ov.idSnapshot() // อ่านหลัง open (open = id ขยับ): close/reopen ระหว่างแล่น = ผลทั้งหน้าถูกทิ้ง
+        val live = { ov.idSnapshot() == pageId } // callback ทั้งหมด belong overlay นี้ — toast/log ห้ามตามหลัง close (§Threading)
+        val pager = OverlayPager(
+            backend = src.backend,
+            target = src.target,
+            onPrepend = { if (live()) ov.prependPage(it) },
+            onTrimBottom = { if (live()) ov.trimBottom(it) },
+            onStatus = { loading -> if (live() && loading) toast("Loading history…") },
+            onWarn = { if (live()) ConnectionLog.d("tmux overlay: $it") },
+        )
+        ov.onPull = { pager.pull() }
+        ov.onWarn = { if (live()) ConnectionLog.d("tmux overlay: $it") } // view-level fail-soft ต้องลง log (มาตรฐาน swallow)
+        // IME ถูก closeImeForMenus() ปิดแล้วตั้งแต่ก่อนเปิด ⋮ (policy task 10) — overlay ไม่ต้องซ้ำ
+        lifecycleScope.launch { ov.onPull() } // หน้าแรกเปิดปุ๊บโผล่ปั๊บ (gesture = หน้าถัด ๆ ไป)
+    }
+
+    /**
+     * tmux/08: (logical, display) ของ scrollback ฝั่ง app — capture ฝั่ง tmux นับ logical (`-J`),
+     * window ต้อง clamp ด้วย display depth ของเรา; null = renderer ไม่พร้อม (puller abort ทั้งรอบ)
+     *  - native: นับ !isWrapped ช่วง [0, baseY) — ช่วง history เท่านั้น (viewport ≡ tmux viewport ไม่ใช่ history)
+     *  - webview: evaluateJavascript round-trip → Droid.historyDepths (9k iteration ฝั่ง JS, async จริง)
+     */
+    private suspend fun historyDepths(s: TerminalSession): Pair<Int, Int>? {
+        if (s.native) {
+            val b = s.engine?.buf ?: return null
+            var logical = 0
+            for (i in 0 until b.baseY) if (!b.lines[i].isWrapped) logical++
+            return logical to b.baseY
+        }
+        return withTimeoutOrNull(1_500) {
+            try {
+                suspendCancellableCoroutine<Pair<Int, Int>?> { c ->
+                    s.historyDepthsCont = c
+                    c.invokeOnCancellation { if (s.historyDepthsCont === c) s.historyDepthsCont = null }
+                    s.js("window.atermHistoryDepths && atermHistoryDepths();")
+                }
+            } finally {
+                s.historyDepthsCont = null
+            }
+        }
+    }
+
+    /** tmux/08: inject หนึ่งหน้า — native = parse → prependHistory (view content-lock); webview = patched xterm API */
+    private fun injectHistoryPage(s: TerminalSession, lines: List<String>) {
+        if (lines.isEmpty()) return
+        if (s.native) {
+            val tv = s.view as? TerminalView ?: return
+            val cols = s.engine?.cols ?: tv.gridCols
+            // unit = display fragmentsหลัง re-wrap ที่ cols ของ app (1 logical → >1 เมื่อ wrap) — kept/evicted ต้องนับหน่วยเดียวกัน
+            val parsed = parseHistoryText(lines, cols)
+            val kept = tv.injectHistory(parsed)
+            ConnectionLog.d("history inject native page=${lines.size} parsed=${parsed.size} kept=$kept (cap evicted ${parsed.size - kept})")
+            if (kept > 0) toast("Loaded ${lines.size} older lines")
+        } else {
+            val json = org.json.JSONArray(lines).toString()
+            s.js("window.atermPrependHistory && atermPrependHistory($json);")
+            // ไม่มี completion toast ฝั่ง webview — JS คืนค่าไม่ได้ = "Loaded" จะเป็นคำลวง (scrollback ฝั่ง JS เต็ม/cap refuse หมดก็เงียบ)
+            ConnectionLog.d("history inject webview page=${lines.size}")
+        }
+    }
+
+    /**
+     * tmux/07: ถูกปลุกโดย hook — แปลงชื่อ session (payload) → `$id` (identity ที่ attach ได้)
+     * แล้ว post notification ที่ tap = กลับเครื่อง/โฟกัสแท็บนั้น (resolve fail = ยัง notify, tap แค่เปิดแอป)
+     * exec fail กลางทาง = เงียบรอบนี้ (waiter re-arm เอง; alert ที่หลุดดีกว่า notification เก่าผิดตัว)
+     */
+    private fun handleTmuxAlert(s: TerminalSession, backend: dev.aterminal.core.TerminalBackend, p: dev.aterminal.core.Profile, alert: dev.aterminal.core.TmuxAlerts.Alert) {
+        lifecycleScope.launch {
+            val listing = runCatching { TmuxBrowser(backend).sessions() }
+            val sessionId = listing.getOrNull()?.getOrNull()?.let { dev.aterminal.core.TmuxAlerts.sessionIdNamed(it, alert.session) }
+            if (sessionId == null) { // §Threading: swallow ต้องมี log — "ชื่อไม่มีใน list" (renamed/gone) กับ "exec fail" ต้องแยกได้จาก log
+                val cause = listing.exceptionOrNull() ?: listing.getOrNull()?.exceptionOrNull()
+                ConnectionLog.d(
+                    "tmux alert: id unresolved for '${alert.session}'" +
+                        (if (cause != null) " cause=${cause.javaClass.simpleName}" else " (renamed or gone)") +
+                        " — tap = bring-to-front",
+                )
+            }
+            postTmuxAlertNotification(p, alert, sessionId)
+        }
+    }
+
+    /** channel + heads-up; id ต่อ notification = counter (ไม่ใช่ hash — กันชนของเก่าที่ user ยังไม่แตะ) */
+    private fun postTmuxAlertNotification(p: dev.aterminal.core.Profile, alert: dev.aterminal.core.TmuxAlerts.Alert, sessionId: String?) {
+        val nm = getSystemService(android.app.NotificationManager::class.java) ?: return
+        if (nm.getNotificationChannel(TMUX_ALERT_CHANNEL) == null) { // idempotent — create ครั้งแรกที่ใช้ (minSdk 29 = channel API มีแน่)
+            nm.createNotificationChannel(
+                android.app.NotificationChannel(TMUX_ALERT_CHANNEL, "Tmux alerts", android.app.NotificationManager.IMPORTANCE_HIGH),
+            )
+        }
+        if (android.os.Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) return // user เลือกไม่อนุญาต (flow เดิม REQ_NOTIFICATIONS) = ห้ามเด้งขออนุญาตใหม่ทุก alert
+        val intent = android.content.Intent(this, MainActivity::class.java).apply {
+            action = ACTION_TMUX_ALERT
+            putExtra(EXTRA_ALERT_PROFILE, p.guid)
+            putExtra(EXTRA_ALERT_SESSION_ID, sessionId)
+            flags = android.content.Intent.FLAG_ACTIVITY_NEW_TASK or android.content.Intent.FLAG_ACTIVITY_CLEAR_TOP
+        }
+        val pi = android.app.PendingIntent.getActivity(
+            this, 0, intent,
+            android.app.PendingIntent.FLAG_IMMUTABLE or android.app.PendingIntent.FLAG_UPDATE_CURRENT,
+        )
+        val n = android.app.Notification.Builder(this, TMUX_ALERT_CHANNEL) // builder เดียวกับ SessionKeepAliveService (minSdk 29 = channel มีแน่)
+            .setSmallIcon(android.R.drawable.stat_notify_chat) // resource ระบบ — icon เฉพาะตัวตามหลัง
+            .setContentTitle(dev.aterminal.core.TmuxAlerts.title(alert))
+            .setContentText(dev.aterminal.core.TmuxAlerts.text(alert))
+            .setContentIntent(pi)
+            .setAutoCancel(true)
+            .build()
+        val id = ++alertNotifyId // เพิ่มต่อตัวใน process; ข้าม restart ไม่ชนกันเพราะ seed ตามเวลา (ดู decl)
+        nm.notify(id, n)
+        ConnectionLog.d("tmux alert: ${alert.type} ${alert.session}/${alert.window} id=$sessionId")
+    }
+
+    /**
+     * tmux/07 tap path: focus live tab ของ profile เดิมก่อน; ไม่มีแท็บเป็น ๆ = เปิดแท็บใหม่ attach ด้วย $id
+     * (attach ชื่อ ห้าม — name rename ได้หลัง alert; sessionId null = resolve fail, ปล่อยเป็น bring-to-front)
+     */
+    private fun openAlertTarget(profileGuid: String?, sessionId: String?) {
+        connectUi.dismissProfileList() // boot picker ของ empty tab ค้างทับ pane ที่เพิ่ง dial (วัด device 11-07)
+        val existing = manager.ids().firstOrNull { id ->
+            manager.get(id)?.panes?.any { it.profile?.guid != null && it.profile?.guid == profileGuid } == true
+        }
+        if (existing != null) {
+            ConnectionLog.d("alert tap: focus existing tab of ${profileGuid?.take(8)}")
+            switchTab(existing)
+            return
+        }
+        val p = settings.profiles.list.firstOrNull { it.guid != null && it.guid == profileGuid }
+            ?: run {
+                ConnectionLog.d("alert tap: profile ${profileGuid?.take(8)} not in settings (deleted?) — bring-to-front only")
+                return
+            }
+        if (sessionId != null) {
+            connectProfile(p.copy(commandline = dev.aterminal.core.TmuxListing.attachCommandline(sessionId)))
+        } else {
+            connectProfile(p)
+        }
     }
 
     // ---------------- T4: session restore (round 13) ----------------
@@ -2805,7 +3155,9 @@ class MainActivity : ComponentActivity() {
             // round 23 T5 permanent diagnostic (webview twin of onGridResize): JS-fit grid vs current pty
             Log.i("AtermResize", "webview grid ${cols}x${rows} pty ${s.cols}x${s.rows}")
             s.cols = cols; s.rows = rows
+            s.historyGen++ // tmux/08 twin ของ onGridResize: xterm reflow (webview) = anchor เก่าของ puller invalid (Q3)
             s.controller.resize(cols, rows)
+            s.stripHost?.resize(cols, rows) // tmux/09 twin: บอก -C ของ control client ด้วย (PTY size ไม่ propagate)
             runOnUiThread {
                 // review fix (task 7): TabInfo.cols/rows + header "name (W×H)" เป็น snapshot —
                 // ทุก writer ของ s.cols/s.rows ต้อง refreshTabs ด้วย (resize ไม่ใช่ hot-path)
@@ -2835,6 +3187,26 @@ class MainActivity : ComponentActivity() {
 
         @JavascriptInterface
         fun copyToClipboard(text: String) = copyTextToClipboard(text)
+
+        /** tmux/03: webview OSC52 (terminal.html registerOscHandler → Droid.osc52) — payload ดิบส่วนหลัง `52;`
+         *  ≡ native path ทุกอย่าง (handleOsc52 เดียวกัน; query ตอบเข้า pty ไม่วนกลับเข้า JS) */
+        @JavascriptInterface
+        fun osc52(payload: String) = handleOsc52(session(), payload)
+
+        /** tmux/08: user ปัดถึง ydisp==0 (terminal.html term.onScroll) — เข้า main ให้ lifecycleScope ของ puller เห็น single-thread เดียว */
+        @JavascriptInterface
+        fun historyEdge() { runOnUiThread { requestHistoryPull(session()) } }
+
+        /** tmux/08: ผลวัด depths จาก atermHistoryDepths() — resume continuation ที่ historyDepths() รอไว้ */
+        @JavascriptInterface
+        fun historyDepths(logical: Int, display: Int) {
+            val s = session()
+            runOnUiThread {
+                val c = s.historyDepthsCont ?: return@runOnUiThread
+                s.historyDepthsCont = null
+                c.resumeWith(kotlin.Result.success(logical to display))
+            }
+        }
 
         @JavascriptInterface
         fun backendType(): String = session().profile?.type ?: "none"
@@ -2873,15 +3245,77 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    /** tmux/03: lookup เดียวกับ paletteFor/colorSchemeJson — สีที่ OSC query ตอบ = สีที่ renderer วาดจริง */
+    private fun schemeFor(s: TerminalSession): Scheme = schemeForProfile(s.profile)
+
+    /**
+     * tmux/03: consumer ของ native engine — title (tmux/04) + OSC 52 + colour query (10/11/12/4 form `?`)
+     * callback วิ่งบน thread ที่เขียน engine (pty reader) → งาน clipboard ต้องผ่าน main thread เสมอ;
+     * ฝั่ง webview ≡ terminal.html registerOscHandler + SessionBridge.osc52 (decoder ตัวเดียวกัน OscClipboard)
+     * ฝั่ง webview xterm.js ตอบ DA/colour query เองแล้ว — native ≡ ด้วย engine onResponse + ฟังก์ชันนี้
+     */
+    private fun routeNativeOsc(s: TerminalSession, code: Int, text: String) {
+        when (code) {
+            0, 2 -> noteTerminalTitle(s, text)
+            52 -> handleOsc52(s, text)
+            10, 11, 12 -> if (text == "?") {
+                val scheme = schemeFor(s)
+                val hex = when (code) {
+                    11 -> scheme.background
+                    12 -> scheme.cursorColor ?: scheme.foreground
+                    else -> scheme.foreground
+                }
+                TerminalReports.colorReportOrNull(code, hex)?.let { s.controller.write(it) }
+            }
+            4 -> { // `N;?` = query → ตอบสี palette ตัวเดียวกับที่ renderer วาด; form set (ไม่ใช่ `?`) = native ยังไม่รองรับ (parity gap จดในตั๋ว)
+                val parts = text.split(";")
+                if (parts.size == 2 && parts[1] == "?") {
+                    val idx = parts[0].toIntOrNull() ?: return
+                    schemeFor(s).paletteColor(idx)?.let { hex ->
+                        TerminalReports.indexedColorReportOrNull(idx, hex)?.let { s.controller.write(it) }
+                    }
+                }
+            }
+            else -> {} // OSC อื่น = ignore เหมือนเดิม
+        }
+    }
+
+    /**
+     * tmux/03: OSC52 สอง renderer ใช้ entry เดียว — write = copyTextToClipboard (guard autoPaste + retry ครบ);
+     * query = อ่าน clipboard เฉพาะ foreground (privacy: บังคับด้วย uiResumed, ไม่ใช่แค่ claim)
+     * reply = encodeReply (echo target, terminators BEL ≡ `Ms` ของ tmux) เขียนเข้า pty ตรง ๆ
+     */
+    private fun handleOsc52(s: TerminalSession, payload: String) {
+        val osc = OscClipboard.decodePayload(payload)
+        if (osc == null) { // payload แปลงไม่ได้ = ทิ้งเงียบแต่ต้องเห็นใน log (รับเรื่อง user ได้)
+            ConnectionLog.d("osc52 payload rejected (decode) len=${payload.length}")
+            return
+        } // trace = target/query/ขนาดเท่านั้น ห้าม log เนื้อหา clipboard (privacy)
+        ConnectionLog.d("osc52 target=${osc.target} query=${osc.query} bytes=${osc.data.size}")
+        runOnUiThread { // ทั้งงาน = main thread (toast ใน copyTextToClipboard + clipboard API — KDoc ของ routeNativeOsc)
+            if (!osc.query) { copyTextToClipboard(String(osc.data, Charsets.UTF_8)); return@runOnUiThread }
+            if (!uiResumed) return@runOnUiThread // privacy (ticket 03): background = ห้ามแตะ clipboard เลย (บังคับ, ไม่ใช่ only-asserted)
+            val text = runCatching {
+                clipboard().primaryClip?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.coerceToText(this)?.toString()
+            }.onFailure { ConnectionLog.d("osc52 query clip read failed: ${it.javaClass.name}") }
+                .getOrNull() ?: return@runOnUiThread // ไม่มี clip = เงียบตามสัญญา (vim รับ timeout เอง)
+            val bytes = text.toByteArray(Charsets.UTF_8)
+            val reply = OscClipboard.encodeReply(osc.target, bytes) // null = clip เกินเพดาน reply (MAX_REPLY_BYTES)
+            if (reply == null) ConnectionLog.d("osc52 reply skipped: clipboard too large bytes=${bytes.size}")
+            else s.controller.write(reply)
+        }
+    }
+
     /**
      * setPrimaryClip + re-arm: บน emulator ที่ WebView provider = com.android.chrome,
      * renderer (uid ของ chrome, ไม่มี window focus) จะ probe clipboard ทุก event รอบ ๆ
      * (long-press/selection/menu) → ClipboardService "Denying ... Clearing clipboard" =
      * system clip โดนล้างทันทีหลังเรา set (ตรวจพบ round 3: copy แล้ว clip หายทั้งก้อน)
      * — re-arm เฉพาะเมื่อ clip กลายเป็นว่าง (ว่าง = ระบบล้าง; ถ้ามี text อื่น = user copy จาก app อื่น ห้ามทับ)
+     *
+     * clipboard entry เดียวกันของสอง path: JS bridge (webview) + TerminalView.onCopy (native, T2)
+     * internal = tmux/04 preset dialog (ConnectUi) ใช้ entry เดียวกัน — กัน clip-denial re-arm หายไปตาม path
      */
-    /** clipboard entry เดียวกันของสอง path: JS bridge (webview) + TerminalView.onCopy (native, T2)
-     *  internal = tmux/04 preset dialog (ConnectUi) ใช้ entry เดียวกัน — กัน clip-denial re-arm หายไปตาม path */
     internal fun copyTextToClipboard(text: String) {
         lastCopiedByApp = text
         lastSetClip = text
@@ -2916,6 +3350,11 @@ class MainActivity : ComponentActivity() {
         private const val CRASH_LOOP_WINDOW_MS = 15_000L    // T4: boot ใหม่ไวเกินไปหลัง restore attempt = ข้าม restore ครั้งเดียว
         private const val TITLE_DEBOUNCE_MS = 500L          // tmux/04: trailing window ของ OSC title → pill
         private const val TMUX_PENDING_MS = 5_000L          // tmux/05: timeout ของ prefix-pending (Q5 — client-side cancel เท่านั้น)
+        // tmux/07: notification + deep-link contract (PendingIntent ฝั่ง post ต้องใช้ key ชุดเดียวกับ onNewIntent)
+        private const val TMUX_ALERT_CHANNEL = "tmux_alerts"
+        private const val ACTION_TMUX_ALERT = "dev.aterminal.app.action.TMUX_ALERT"
+        private const val EXTRA_ALERT_PROFILE = "alert_profile_guid"
+        private const val EXTRA_ALERT_SESSION_ID = "alert_tmux_session_id"
     }
 }
 

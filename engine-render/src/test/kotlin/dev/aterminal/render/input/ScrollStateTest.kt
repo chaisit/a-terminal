@@ -83,7 +83,7 @@ class ScrollStateTest {
         assertEquals(0, s.top)
     }
 
-    // ── OPEN #3 (round 12): eviction compensation — gold ≡ xterm probe (evidence/round-11/xterm-sticky-probe.txt)
+    // ── eviction compensation — verified against xterm behaviour via captured probe output
 
     @Test fun `pinned view content-locks under eviction - gold probe ydisp 20 to 14`() {
         val s = ScrollState()
@@ -132,5 +132,22 @@ class ScrollStateTest {
         s.onOutput(0, 30) // sticky at bottom
         assertFalse(s.revealForInput(30))
         assertEquals(30, s.top)
+    }
+
+    // tmux/08: history prepend — content เลื่อนลง k บรรทัด, view ต้องเลื่อนตาม = มอง content เดิมต่อ
+    // (pull trigger ที่ top == 0 — หลัง inject ผู้ใช้ยังเห็นบรรทัดเดิม, ของใหม่อยู่เหนือให้ปัดต่อ)
+    @Test fun `prepend shifts pinned view with the content (tmux-08 pull)`() {
+        val s = ScrollState()
+        s.onOutput(0, 30)
+        s.toTop(30) // ขอบบน = trigger
+        s.shiftForPrepend(5, 35)
+        assertEquals(5, s.top) // ยังจ้องบรรทัดเดิม (เดิม index 0 = ตอนนี้ index 5)
+    }
+
+    @Test fun `prepend shift keeps tail-sticky at tail`() {
+        val s = ScrollState()
+        s.onOutput(0, 30) // sticky ที่ baseY
+        s.shiftForPrepend(5, 35)
+        assertEquals(35, s.top) // tail เลื่อนตาม = ยัง sticky (screen content ไม่เปลี่ยน)
     }
 }

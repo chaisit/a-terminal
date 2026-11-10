@@ -131,4 +131,12 @@ class TmuxVersionTest {
         assertFalse(caps("tmux 3.7").themeOptions)
         assertTrue(caps("tmux next-3.8").themeOptions)
     }
+
+    @Test
+    fun `TAB-safe format gates at 3_6 (lab 11-06 - tmux 3_4 turns literal TAB in -F into underscore, 3_6 passes it)`() {
+        assertFalse(caps("tmux 3.4").tabInFormatSafe) // container: "a<TAB>b" → "a_b" (od -c)
+        assertFalse(caps("tmux 3.5").tabInFormatSafe) // 3.5 ยังไม่ได้วัด → conservative = ปิด
+        assertTrue(caps("tmux 3.6").tabInFormatSafe) // host: "cmd<TAB>path" ผ่านตรง ๆ (od -c)
+        assertTrue(caps("tmux next-3.7").tabInFormatSafe)
+    }
 }

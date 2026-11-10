@@ -31,6 +31,17 @@ class TermuxBackend(
     // tmux/02: delegate คือ SshBackend เสมอ (Termux = sshd บนเครื่อง) → capability gate เห็น version ผ่านทางนี้
     override val tmuxCapabilities: dev.aterminal.core.TmuxCapabilities? get() = delegate?.tmuxCapabilities
 
+    // tmux/06: exec channel ก็ delegate ผ่าน SshBackend ตัวเดียวกัน (session browser บน Termux = exec ผ่าน sshd เครื่อง)
+    override suspend fun exec(command: String, timeoutMs: Long): dev.aterminal.core.ExecResult =
+        delegate?.exec(command, timeoutMs) ?: throw notConnected()
+
+    // tmux/07: listener ก็ delegate เช่นกัน — เก็บไว้ให้ connect (ครั้งที่ delegate เกิด) push ต่อเอง, set หลัง connect = ยิงถึงทันที
+    override var onTmuxProbe: ((dev.aterminal.core.TmuxCapabilities?) -> Unit)? = null
+        set(value) {
+            field = value
+            delegate?.onTmuxProbe = value
+        }
+
     override suspend fun connect(startup: StartupArgs) {
         val f = factory ?: throw BackendError(
             BackendError.Code.LOCAL_SERVICE_MISSING,
@@ -39,6 +50,7 @@ class TermuxBackend(
         val d = f("127.0.0.1", sshPort)
         d.onData = { onData(it) }
         d.onClosed = { onClosed(it) }
+        d.onTmuxProbe = onTmuxProbe // tmux/07: listener ที่ app ตั้งไว้ก่อน connect ต้องไม่หาย
         delegate = d
         try {
             d.connect(startup)

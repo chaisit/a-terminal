@@ -4,8 +4,9 @@ package dev.aterminal.app
  * ticket tmux/04: "tmux preset" = commandline แนะนำ (ต่อจาก ticket 01) + snippet `.tmux.conf`
  * ที่ app generate ให้ **copy เท่านั้น** (ห้ามเขียนไฟล์ user — user เป็นผู้ paste เอง, เครื่อง user is the owner)
  *
- * gating: ทุกบรรทัดใน snippet เป็น tmux syntax ยุค 1.x+ (set-titles/mouse) — ใช้ได้กับทุก version
- * ที่ app รองรับ (probe ต่ำกว่า 2.6 = feature ฝั่ง app เงียบ แต่ config ไม่พัง)
+ * gating: set-titles/mouse เป็น tmux ยุค 1.x+ — ปลอดภัยกับทุก version ที่ app รองรับ
+ * section alert (07) = form ที่วัดผ่านบน 3.4/3.6; server เก่ากว่าที่ set-hook ไม่รับ = tmux พิมพ์ error
+ * ตอน source แล้วข้ามบรรทัดนั้น (conf ไม่พังทั้งไฟล์, feature แค่ไม่ทำงาน — user เห็น error ใน tmux เอง)
  */
 object TmuxPreset {
 
@@ -13,8 +14,13 @@ object TmuxPreset {
     const val commandline = "tmux new -A -s main"
 
     /**
-     * exact text ที่ user copy (test คุมต่อแถว) — section "alert" มาแบบ comment วันนี้
-     * เพื่อ user ที่ paste รอบนี้ไม่ต้องกลับมา paste ใหม่อีกรอบเมื่อ ticket 07 มาถึง (Q4)
+     * exact text ที่ user copy (test คุมต่อแถว) — ticket 07: section alert เป็นบรรทัดใช้งานจริง
+     *
+     * form Z = รูปแบบเดียวที่ผ่าน config-file parser (lab 11-06: บล็อก `{ }` ใช้ใน hook string ไม่ได้ = เงียบทั้ง hook;
+     * วัด payload จริง `bell|alert-test|bash` บน 3.4) — channel/option ดึงจาก TmuxAlerts ตรง ๆ กัน drift
+     *  - `monitor-bell on` (global window option): off = alert-bell hook ไม่ยิงบน window นั้น (วัด lab เช่นกัน)
+     *  - `bell-action any`: bell จาก window อื่นก็ raise alert (default = only current window)
+     * activity/silence ยังไม่ติด (ยังไม่ได้วัด semantics ด้วย client ที่ attach จริง — deferred ในตั๋ว 07; TYPES ฝั่ง parser รองรับไว้แล้ว)
      */
     val snippet: String = """
         # A-Terminal tmux preset — paste into ~/.tmux.conf
@@ -22,9 +28,15 @@ object TmuxPreset {
         set -g set-titles-string '#S:#I:#W'
         set -g mouse on
 
-        # alert bells/hooks — uncomment when A-Terminal ships notification hooks (ticket 07)
-        # set -g bell-action any
-        # set -g visual-bell off
+        # clipboard → Android (ticket 03): default `external` = pane OSC 52 ถูกทิ้ง, ต้อง on
+        set -s set-clipboard on
+        set -as terminal-features 'xterm*:clipboard'
+
+        # alerts → Android notifications (bell): payload ลง option แล้วปลุก wait-for ของ app
+        set -gw monitor-bell on
+        set -g bell-action any
+        set -g visual-bell off
+        set-hook -ag alert-bell 'run-shell "tmux set -g ${dev.aterminal.core.TmuxAlerts.PAYLOAD_OPTION} \"bell|#S|#W\"; tmux wait-for -S ${dev.aterminal.core.TmuxAlerts.CHANNEL}"'
     """.trimIndent()
 
     /**

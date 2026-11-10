@@ -501,6 +501,67 @@ class TerminalEngineTest {
         assertEquals("─", cell(e2, 0, 0).ch)
     }
 
+    @Test fun da2RepliesXterm276AndChangesNothing() { // `CSI > c` = DA2 — reply matches xterm.js 5.5; no grid/state effect
+        val got = StringBuilder()
+        val e = eng(s = arrayOf("hi"))
+        e.onResponse = { got.append(it) }
+        e.write(x("~001b[>c").toByteArray(Charsets.UTF_8))
+        assertEquals(ESC + "[>0;276;0c", got.toString())
+        assertEquals(2, e.buf.x); assertEquals(0, e.buf.y) // cursor kept — DA2 is read-only like DA1
+        assertEquals("h", cell(e, 0, 0).ch); assertEquals("i", cell(e, 0, 1).ch)
+    }
+
+    @Test fun prependHistoryLandsOnHistorySideAndReportsContentShift() { // seam: inject older lines above scrollback
+        val e = eng(c = 10, r = 3, h = 5, s = arrayOf("AAA~000d~000aBBB~000d~000aCCC~000d~000aDDD~000d~000a"))
+        val src = eng(c = 10, r = 3, h = 5, s = arrayOf("OLD1~000d~000aOLD2~000d~000a"))
+        val shift = e.prependHistory(listOf(src.buf.lines[0], src.buf.lines[1]))
+        assertEquals(2, shift) // existing content shifted down by exactly what the buffer retained
+        assertEquals("O", e.buf.lines[0].get(0).ch) // oldest first at the head
+        assertEquals("O", e.buf.lines[1].get(0).ch)
+        assertEquals("A", e.buf.lines[2].get(0).ch) // previous head line now below the injected pair
+        assertEquals("C", cell(e, 0, 0).ch) // live grid = same 3 lines as before the injection (baseY shifted with content)
+    }
+
+    @Test fun prependHistoryBeyondCapEvictsInjectedLinesFirst() { // rows+maxHistory cap stays absolute (OOM bound)
+        val e = eng(c = 10, r = 3, h = 2, s = arrayOf("H1~000d~000aH2~000d~000aH3~000d~000aH4~000d~000aH5~000d~000a"))
+        assertEquals(5, e.buf.lines.size) // at cap rows+maxHistory
+        val src = eng(c = 10, r = 3, h = 5, s = arrayOf("X1~000d~000aX2~000d~000aX3~000d~000a"))
+        val shift = e.prependHistory(listOf(src.buf.lines[0], src.buf.lines[1], src.buf.lines[2]))
+        assertEquals(0, shift) // nothing retained: cap was full, injected lines are the oldest = evicted first
+        assertEquals(5, e.buf.lines.size)
+        assertEquals("H2", e.buf.lines[0].get(0).ch + e.buf.lines[0].get(1).ch) // original head survives untouched
+    }
+
+    @Test fun prependHistoryCapTrimNeverTouchesEvictedTotal() { // evictedTotal = output-driven loss only; injection refused at the cap was never in a view
+        val e = eng(c = 10, r = 3, h = 2, s = arrayOf("H1~000d~000aH2~000d~000aH3~000d~000aH4~000d~000aH5~000d~000a"))
+        // push past the cap with normal output so evictedTotal > 0, proving the compare isn't vacuous
+        e.write(x("H6~000d~000a").toByteArray(Charsets.UTF_8))
+        assertTrue(e.buf.evictedTotal > 0)
+        val ev = e.buf.evictedTotal
+        val src = eng(c = 10, r = 3, h = 5, s = arrayOf("X1~000d~000aX2~000d~000aX3~000d~000a"))
+        e.prependHistory(listOf(src.buf.lines[0], src.buf.lines[1], src.buf.lines[2])) // cap trims 3 = whole injection
+        assertEquals(ev, e.buf.evictedTotal)
+    }
+
+    @Test fun prependHistoryIntoZeroHistoryBufferRefusesAll() { // inject-layer alt-screen guard: maxHistory=0 = everything refused, screen untouched
+        val e = eng(c = 10, r = 3, h = 0, s = arrayOf("A~000d~000aB~000d~000aC"))
+        val src = eng(c = 10, r = 3, h = 5, s = arrayOf("X~000d~000a"))
+        val shift = e.prependHistory(listOf(src.buf.lines[0]))
+        assertEquals(0, shift)
+        assertEquals("A", cell(e, 0, 0).ch)
+        assertEquals("C", cell(e, 2, 0).ch)
+    }
+
+    @Test fun prependHistoryKeepsWrappedFlagForGroupIntegrity() { // Reflow joins by isWrapped — injected lines must keep it
+        val e = eng(c = 10, r = 3, h = 5, s = arrayOf("AAA~000d~000a"))
+        val src = eng(c = 10, r = 3, h = 5, s = arrayOf("0123456789AB")) // 12 cols at width 10 → second row isWrapped
+        assertTrue(src.buf.lines[1].isWrapped)
+        val shift = e.prependHistory(listOf(src.buf.lines[0], src.buf.lines[1]))
+        assertEquals(2, shift)
+        assertFalse(e.buf.lines[0].isWrapped)
+        assertTrue(e.buf.lines[1].isWrapped)
+    }
+
     @Test fun decstrSoftResetScope() { // decstr_scope (reset-scope): no home, pen/margins/origin/saved-slot reset, history kept
         val e = eng(s = arrayOf("~001b[10;20r~001b[?6h~001b[1;41m~001b[!p", "A~000d~000a".repeat(1), "~000d~000a".repeat(19), "z"))
         assertEquals(1, e.buf.x); assertEquals(23, e.buf.y); assertEquals(6, e.buf.baseY); assertEquals(30, e.buf.lines.size)

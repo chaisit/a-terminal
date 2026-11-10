@@ -42,8 +42,12 @@ android {
         // (crash on one device), and runs drawn with a fallback font needed per-cell anchoring to stay aligned
         // 0.5.6–0.5.10 (code 25–29): keyboard suggestions — settings.imeSuggestions (default now strict),
         // ⌨️ toggle + Keyboard settings… in the ⋮ menu, and a one-time hint per keyboard when it ignores the flag
-        versionCode = 31
-        versionName = "0.5.12"
+        // 0.5.13 (code 32): OSC 52 clipboard bridge, tmux history overlay (read older history past the
+        // scrollback), and a window strip driven by a `tmux -CC` control session
+        // 0.5.14 (code 33): the history overlay is truly read-only (keys and keyboard stay out of the shell
+        // while it is open), and switching tabs no longer drops the connection (control-channel close moved off the main thread)
+        versionCode = 33
+        versionName = "0.5.14"
     }
 
     signingConfigs {

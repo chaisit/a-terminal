@@ -58,6 +58,24 @@ class ScreenBuffer(val cols: Int, val rows: Int, val maxHistory: Int) {
     }
 
     /**
+     * push older lines above the scrollback (host-pulled history older than the app's own)
+     * incoming = oldest-first, refs aliased (same rule as everywhere — never recycle a TermLine).
+     * cap rows+maxHistory stays absolute: trimHead evicts the injected head first when there is no room,
+     * so the visible screen can never be pushed out. Returns the net content shift (lines retained) —
+     * a host pinning a view adds it to its scroll offset so the view does not jump.
+     * evictedTotal is untouched: it counts lines lost to normal output, not lines refused at injection.
+     */
+    fun prependHistory(incoming: List<TermLine>): Int {
+        if (incoming.isEmpty()) return 0
+        val before = lines.size
+        val ev = evictedTotal
+        for (i in incoming.indices.reversed()) lines.addFirst(incoming[i])
+        trimHead()
+        evictedTotal = ev // the cap trim above removed only injected lines (head = oldest) — restore: they were never in any view
+        return lines.size - before
+    }
+
+    /**
      * scroll region [top,bot] up by n lines (content moves up, blank at the region bottom)
      * fullScreenHistory = the caller confirms this scroll comes from lineFeed/wrap (only LF/wrap earns history)
      */
