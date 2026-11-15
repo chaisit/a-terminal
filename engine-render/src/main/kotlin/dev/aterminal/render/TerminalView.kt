@@ -1014,7 +1014,14 @@ class TerminalView @JvmOverloads constructor(context: Context, attrs: AttributeS
                         preEdit.closeCorrection()
                         imeTrace("preedit close finish")
                     }
-                    fed?.let { feedText(it) }
+                    // ticket 13 (F-2b, oracle public 0.5.18): flush ของ finish = bytes ของ dance เอง
+                    // (PTY tail ≡ lastFinished พอดี) — ต้อง mark danceFeed ไม่งั้น funnel ข้างบน
+                    // ปิด window ที่ finish() เพิ่งเปิด = window ตายก่อน dance เริ่ม,
+                    // delete(k,0) หลัง finish ตก fall-through (silent DEL 1 ตัว) = คำแก้แล้วซ้ำใน buffer
+                    if (fed != null) {
+                        danceFeed = true
+                        try { feedText(fed) } finally { danceFeed = false }
+                    }
                     rawSentText = ""
                     invalidate()
                 }

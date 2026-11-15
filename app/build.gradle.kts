@@ -51,8 +51,12 @@ android {
         // 0.5.18 (code 37): Gboard's correction edits (re-typing a word it just sent) replace the word
         // instead of appending a second copy of it in the native terminal; the ime log gained
         // per-call tracing, codepoint feeds, and throttled skip lines
-        versionCode = 37
-        versionName = "0.5.18"
+        // 0.5.19 (code 38): the correction fix round 2 — 0.5.18 missed one case: the flush that
+        // follows "finish composing" closed the correction window it had just opened, so a retract
+        // arriving right after a finished word fell through to a single backspace and the corrected
+        // word was appended instead of replacing it; the flush now counts as part of the dance
+        versionCode = 38
+        versionName = "0.5.19"
     }
 
     signingConfigs {

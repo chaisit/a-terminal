@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.5.19
+
+One fix, on top of 0.5.18: its Thai correction fix missed one case, and the duplicated word came
+back on a real device. v0.5.18 is deprecated in favor of this release.
+
+### Thai typing
+
+- **The correction dance no longer duplicates the word in the case 0.5.18 missed.** Gboard's edit
+  starts by finishing the composing text — and that finish step itself used to close the correction
+  window it had just opened, before the retract arrived. The retract then fell through to a single
+  backspace and the corrected word was appended after the original, duplicating it — the same
+  symptom 0.5.18 was meant to end. The flush that follows a finish now counts as part of the dance,
+  so the window stays alive and the retract replaces the finished text as intended. Verified on the
+  same device and keyboard that reproduced the bug: the delete removes exactly the finished word and
+  the correction lands once.
+
 ## 0.5.18
 
 The fix round on Thai input with real keyboards, found on real devices (Honor Magic V6 with Gboard,
