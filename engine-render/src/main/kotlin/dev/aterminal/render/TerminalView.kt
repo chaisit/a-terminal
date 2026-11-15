@@ -21,9 +21,12 @@ import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.View
 import android.view.inputmethod.BaseInputConnection
+import android.view.inputmethod.CompletionInfo
+import android.view.inputmethod.CorrectionInfo
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputConnection
 import android.view.inputmethod.InputMethodManager
+import android.view.inputmethod.TextAttribute
 import dev.aterminal.core.ActionTarget
 import dev.aterminal.core.Command
 import dev.aterminal.core.ImeAutocomplete
@@ -113,12 +116,44 @@ class TerminalView @JvmOverloads constructor(context: Context, attrs: AttributeS
             refreshIme() // IME อ่าน EditorInfo ใหม่ = ผลทันทีโดยไม่ต้องปิด-เปิดคีย์บอร์ด
         }
     /**
-     * host นับ "IME ไม่เชื่อ flag" (HW 11-05) — view فقطรายงานสิ่งที่เห็น การตีความ/เตือน
+     * host นับ "IME ไม่เชื่อ flag" (HW 11-05) — view แค่รายงานสิ่งที่เห็น การตีความ/เตือน
      * อยู่ที่ host เพราะ webview ส่งสัญญาณเดียวกันคนละ path (Chromium เป็นเจ้าของ InputConnection)
      * COMPOSITION = IME เปิด composing region ตอนเราขอ password mode; BURST = ข้อความทั้งก้อน
      * ถึง PTY โดยไม่มี composition (autocorrect/แตะคำจาก strip)
      */
     var onImeAutocomplete: ((ImeAutocomplete.Kind, String) -> Unit)? = null
+    /**
+     * hw-backlog/09 (Samsung round 25): อักขระที่เข้าทาง soft keyevent (`sendKeyEvent` → `dispatchKey`
+     * unicodeChar feed) ไม่ผ่าน commitText/setComposingText = เงียบใน IME log ทั้งที่ถึง PTY ครบ
+     * นับ "บรรทัด log ↔ อักขระบนจอ" ไม่ตรงจนเกือบได้ verdict ผิด — view ส่งเฉพาะ codepoint,
+     * ห้ามแปลงเป็น text (IME log ถูก user copy ออกนอกเครื่องได้; host เป็นผู้เขียน hex ลง log)
+     */
+    var onImeKeyFeed: ((Int) -> Unit)? = null
+    /**
+     * hw-backlog/10 (Tab S10+ K2, round 26): preedit lifecycle มี path ที่ feed เข้า PTY แล้ว
+     * เงียบใน IME log = นับ "บรรทัด log ↔ อักขระบนจอ" ไม่ตรง (K2 under-count ≥1 cp) — view
+     * รายงาน *การตัดสินใจ* (commit/finish/preempt/open/close) ด้วย label + len เท่านั้น ห้ามส่ง
+     * เนื้อหา text (IME log ถูก user copy ออกนอกเครื่องได้); host เป็นผู้เขียนบรรทัด `imeSug`
+     * เกณฑ์: ทุก branch ที่ `preEdit.*` แล้ว feed (feedText/feedBytes) หรือ region เปลี่ยนสถานะ
+     * ต้องเรียก imeTrace หนึ่งครั้ง — rollback path (preeditEnabled=false) ห้ามถูกแตะ (byte-for-byte)
+     */
+    var onImeTrace: ((String) -> Unit)? = null
+
+    /**
+     * gate = `preeditEnabled` ล้วน (amendment 11-12, user ตัดสิน B): trace เป็น diagnostic ไม่ใช่ strike
+     * จึงห้ามสืบทอด strict gate — วัดจริง emulator: Gboard compose เฉพาะ non-strict, gate มี imeStrict
+     * เมื่อไหร่ = trace บอดพอดีใน mode ที่ preedit เกิดจริง; detail = literal ที่ห้ามมีเนื้อหา text
+     */
+    private fun imeTrace(detail: String) {
+        if (preeditEnabled) onImeTrace?.invoke(detail)
+    }
+
+    /**
+     * len สำหรับ ic trace (hw-backlog/10 round 27): นับ *code points* ≡ อักขระที่ user เห็นบนจอ
+     * ไม่ใช่ code units (surrogate pair = 1) — เกณฑ์เดิมของ len ทุกบรรทัดใน IME log; null = 0 = "ไม่มี text ในมือ"
+     */
+    private fun traceLen(s: CharSequence?): Int =
+        s?.toString()?.let { it.codePointCount(0, it.length) } ?: 0
     val preEdit = PreEdit()
 
     // ---- find (T6, ≡ aterm-find.js — state อยู่ที่ view เหมือน JS อยู่ที่ bar; HUD = onFindStatus ≡ Droid.findStatus) ----
@@ -456,7 +491,9 @@ class TerminalView @JvmOverloads constructor(context: Context, attrs: AttributeS
         selHandler.removeCallbacks(longPressRunnable)
         kernel.abort() // T3: ทิ้ง state gesture กลางคร่อม (release ทิ้งได้ — engine/session ใหม่แล้ว)
         mouseEm.reset() // T3: motion dedup ของ engine เดิมใช้ไม่ได้
-        preEdit.clear() // T5: composition ค้างผูกกับ session เดิม — feed ลง session ใหม่ไม่ได้
+        // ticket 12: window ที่ค้างข้าม session = replacement bookkeeping ของ session เก่า — close + เห็นใน log
+        if (preEdit.active || preEdit.correctionOpen) imeTrace("preedit close swap") // hw-backlog/10: silent loss ข้าม session ต้องเห็นใน log
+        preEdit.clear() // T5: composition ค้างผูกกับ session เดิม — feed ลง session ใหม่ไม่ได้ (clear = ปิด window ด้วย)
         rawSentText = ""
         finder.reset() // T6: matches/idx อ้าง abs row ของ engine เดิม
         markExit(true) // T7: mark ค้าง = HUD/markOn ต้องถูกปลด (onMarkMode(false)) + anchor/cur ผูก engine เดิม
@@ -477,6 +514,12 @@ class TerminalView @JvmOverloads constructor(context: Context, attrs: AttributeS
     private var rawSentText = ""
 
     /**
+     * F-2 (ticket 12): feed ใดๆ ที่ *ไม่ใช่* ของ correction-dance เอง = PTY tail ไม่ ≡ lastFinished แล้ว
+     * → ปิด window; feed ของ dance เอง (DEL+rest จาก delta) ต้องไม่ปิด window ของตัวเอง (reentry flag)
+     */
+    private var danceFeed = false
+
+    /**
      * preedit ที่ค้างอยู่ *ตอน modifier ถูกกด* = text ที่ user พิมพ์ก่อน modifier → ส่ง raw
      * (ข้าม preFeedTransform — ไม่งั้น transform จะ rewrite text อดีตด้วย modifier ใหม่ + กิน latch)
      * ฝั่ง webview ใช้ทางคู่กัน: Droid.onFlush (round 21, วัดจริงบน emulator)
@@ -486,6 +529,8 @@ class TerminalView @JvmOverloads constructor(context: Context, attrs: AttributeS
         if (pending.isEmpty()) return
         preEdit.clear()
         rawSentText += pending // invariant: คำเต็มของ IME = rawSentText + preEdit.text
+        // hw-backlog/10: feedBytes ทั้งก้อนโดยไม่ผ่าน commitText/setComposingText = ทางเงียบที่ audit เจอเพิ่ม
+        imeTrace("flush-raw len=${pending.codePointCount(0, pending.length)}")
         feedBytes(pending.toByteArray(Charsets.UTF_8))
         invalidate()
     }
@@ -498,6 +543,9 @@ class TerminalView @JvmOverloads constructor(context: Context, attrs: AttributeS
 
     fun feedText(s: String) { feedBytes(preFeedTransform(s).toByteArray(Charsets.UTF_8)) }
     fun feedBytes(b: ByteArray) {
+        // F-2 (ticket 12): bytes จากแหล่งอื่น (keys bar / paste / chord / DEL เก่า) = PTY tail เลื่อนแล้ว
+        // — correction window ของ dance ใช้ไม่ได้ตั้งแต่ this write เป็นต้นไป (rollback path ไม่รู้จัก window)
+        if (preeditEnabled && !danceFeed) preEdit.closeCorrection()
         onFeed?.invoke(b)
         // ≡ xterm.js scrollOnUserInput (default true): พิมพ์ = กลับ tail ปล่อย content-lock
         // (T6 soak supplement: native คง pin กลาง flood แม้ command ทำงานจริง — มองไม่เห็น output)
@@ -845,7 +893,12 @@ class TerminalView @JvmOverloads constructor(context: Context, attrs: AttributeS
         }
         outAttrs.imeOptions = EditorInfo.IME_FLAG_NO_EXTRACT_UI or EditorInfo.IME_FLAG_NO_FULLSCREEN
         return object : BaseInputConnection(this, false) {
+            // hw-backlog/10 round 27 (Tab S10+): ทุก callback ที่ IME เรียกต้องมี `ic <method> len=`
+            // เป็นบรรทัดแรก (label+len เท่านั้น ห้ามเนื้อหา text) — "ไม่มีบรรทัด" ต้องแปลว่า
+            // "IME ไม่ได้เรียก" เท่านั้น ไม่ใช่ "เรียกแต่เราเงียบ"; rollback path ไม่ได้รับผลกระทบ
+            // เพราะ imeTrace ถูก gate ด้วย preeditEnabled อยู่แล้ว (traceLen ก็ไม่มี side effect)
             override fun commitText(text: CharSequence, newCursorPosition: Int): Boolean {
+                imeTrace("ic commitText len=${traceLen(text)}")
                 if (!preeditEnabled) { // path เดิม byte-for-byte (emergency rollback) = ไม่มี preedit ให้วัด
                     if (imeStrict) onImeAutocomplete?.invoke(ImeAutocomplete.Kind.BURST, text.toString())
                     feedText(text.toString()); return true
@@ -853,35 +906,65 @@ class TerminalView @JvmOverloads constructor(context: Context, attrs: AttributeS
                 // T5: t *แทน* composing region — preedit ถูก discard, feed t ครั้งเดียว (≡ G8: onData +1)
                 // t = ทั้งคำ — ตัดส่วนที่ raw-flush/feeding ไปก่อนหน้าแล้วออกก่อน (rawSentText)
                 val composingWasOpen = preEdit.active
+                // F-2 (ticket 12): region ปิด + correction window เปิด = commit ของ correction-dance —
+                // Gboard ตั้งใจให้ *แก้ทับ* คำที่เพิ่ง finish (Honor oracle: append = คำซ้ำใน buffer)
+                // → feed delta เทียบ lastFinished (delta = DEL retreat ใน line editor ≡ replace) แล้วปิด window
+                if (!composingWasOpen && preeditEnabled) {
+                    preEdit.correctionCommit(text.toString())?.let { delta ->
+                        rawSentText = ""
+                        imeTrace("commit replace len=${traceLen(text)} del=${delta.del}")
+                        danceFeed = true
+                        try {
+                            if (delta.del > 0) feedBytes(ByteArray(delta.del) { 0x7f.toByte() })
+                            if (delta.rest.isNotEmpty()) feedText(delta.rest)
+                        } finally { danceFeed = false }
+                        invalidate(); return true
+                    }
+                }
                 val rest = stripWrittenPrefix(text.toString())
                 if (imeStrict && !composingWasOpen) {
                     // rest = ตัวอักษรที่ *เราไม่เคยส่ง* และไม่มี composition กำกับ = IME เติมให้
                     onImeAutocomplete?.invoke(ImeAutocomplete.Kind.BURST, rest)
                 }
                 rawSentText = ""
-                preEdit.commit(rest)?.let { feedText(it) }
+                val fed = preEdit.commit(rest) // hw-backlog/10: region เปิดอยู่แล้ว = ไม่มี BURST line ใด ๆ กำกับ → ต้องมี trace
+                if (composingWasOpen) {
+                    if (fed != null) imeTrace("commit-in-composition len=${fed.codePointCount(0, fed.length)}")
+                    else imeTrace("preedit close commit") // region ปิดแบบไม่มี feed = มีบรรทัดเหมือนกัน
+                }
+                // round 27 silent path สุดท้าย: non-strict + region ปิด = BURST ไม่ยิง (strict เท่านั้น)
+                // และ commit-in-composition ไม่ยิง → feed ต้องมีบรรทัดเสมอทั้งสอง mode (นับ fed ไม่ใช่ text ทั้งก้อน)
+                if (!imeStrict && !composingWasOpen && fed != null) imeTrace("commit len=${traceLen(fed)}")
+                fed?.let { feedText(it) }
                 invalidate(); return true
             }
             override fun setComposingText(text: CharSequence, newCursorPosition: Int): Boolean {
+                imeTrace("ic setComposingText len=${traceLen(text)}")
                 // HW 11-05: password mode ที่ IME เคารพจะไม่มี composing region เลย — มี = ไม่เชื่อ flag
                 // นับครั้งเดียวต่อ region (ไม่ใช่ต่อ update ที่คำยาวขึ้น) = preEdit ยังไม่ active;
                 // path rollback (preeditEnabled=false) ไม่มี preedit ให้อ้าง → วัดด้วย BURST อย่างเดียว
-                if (imeStrict && preeditEnabled && !preEdit.active) {
+                // F-2 (ticket 12): correction window เปิด = Gboard กำลัง *แก้คำเดิม* ไม่ใช่ suggestion ใหม่ — ห้ามสะสม strike
+                if (imeStrict && preeditEnabled && !preEdit.active && !preEdit.correctionOpen) {
                     onImeAutocomplete?.invoke(ImeAutocomplete.Kind.COMPOSITION, text.toString())
                 }
                 // round 21: keys-bar modifier กำลัง active = shortcut, ไม่ใช่ composition — Gboard send
                 // letters ผ่าน setComposingText (วัดจริง ATermMods) ถ้าเก็บเข้า preedit = key แรก "หาย"
                 // (flush ทีหลัง = latch หมดอายุ) → treat-as-final: feed ทันทีผ่าน funnel (+transform)
                 if (preeditEnabled && preemptComposition()) {
+                    val wasOpen = preEdit.active // hw-backlog/10: silent path 4 — region ค้างถูก clear = transition ต้องมีบรรทัด
                     preEdit.clear()
                     val t = text.toString()
-                    if (t.isEmpty()) rawSentText = ""
-                    else {
+                    if (t.isEmpty()) {
+                        rawSentText = ""
+                        if (wasOpen) imeTrace("preedit close preempt")
+                    } else {
                         // Gboard ยังส่งทั้งคำ — ส่งเฉพาะส่วนใหม่ใต้ transform, ส่วนเดิมถูกเขียนไปแล้ว (rawSentText)
                         // ส่งทีละ code point ≡ คีย์จริงกดทีละใต้ modifier (latch = ตัวแรก, hold = ทุกตัว);
                         // ถ้าส่งทั้งก้อน = multi-char → fail-soft ถอด modifier ทั้งกลุ่ม (วัดจริง: Gboard batch ค้าง)
                         val rest = stripWrittenPrefix(t)
                         rawSentText = t
+                        if (rest.isEmpty()) { if (wasOpen) imeTrace("preedit close preempt") }
+                        else imeTrace("preempt-feed len=${rest.codePointCount(0, rest.length)}")
                         var i = 0
                         while (i < rest.length) {
                             val cp = rest.codePointAt(i)
@@ -892,36 +975,129 @@ class TerminalView @JvmOverloads constructor(context: Context, attrs: AttributeS
                     invalidate(); return true
                 }
                 if (!preeditEnabled) { if (text.isNotEmpty()) feedText(text.toString()); return true }
+                // F-2 (ticket 12): composing update ขณะ correction window เปิด = Gboard แก้คำที่เพิ่ง flush —
+                // ส่ง delta เทียบ lastFinished (DEL retreat + หาง) และคง window เปิดไว้ให้ step ถัดไป;
+                // bytes อยู่ PTY แล้วทั้งก้อน ≡ raw-flush (rawSentText = ทั้งคำ, preedit ไม่มีหาง —
+                // update/commit ถัดไปจะผ่าน delta เดียวกันนี้เอง เพราะ window ยังเปิด region ก็ยังว่าง)
+                preEdit.correctionCompose(text.toString())?.let { delta ->
+                    imeTrace("compose replace len=${traceLen(text)} del=${delta.del}")
+                    rawSentText = text.toString()
+                    danceFeed = true
+                    try {
+                        if (delta.del > 0) feedBytes(ByteArray(delta.del) { 0x7f.toByte() })
+                        if (delta.rest.isNotEmpty()) feedText(delta.rest)
+                    } finally { danceFeed = false }
+                    invalidate(); return true
+                }
                 // T5: เก็บไว้ underline ที่ cursor — ไม่ feed (≡ xterm hold; path เดิม = intermediate bytes รั่ว)
                 // เก็บเฉพาะหางที่ *ยังไม่* ถูก raw-write (finish/commit จะ feed จาก preedit — ห้ามซ้ำส่วนที่ส่งแล้ว)
+                val wasActive = preEdit.active // hw-backlog/10: track transition ของ region จริง (COMPOSITION line ≠ "region ฝั่งเราเปิด" — preempt ก่อน = ไม่เปิด)
                 if (rawSentText.isNotEmpty() && text.startsWith(rawSentText)) {
                     preEdit.setComposing(text.toString().substring(rawSentText.length))
                 } else {
                     rawSentText = ""
                     preEdit.setComposing(text.toString())
                 }
+                if (!wasActive && preEdit.active) imeTrace("preedit open")
+                else if (wasActive && !preEdit.active) imeTrace("preedit close update") // update ≡ rawSentText ทั้งคำ = region ยุบตัวเอง
                 invalidate(); return true
             }
             override fun finishComposingText(): Boolean {
+                imeTrace("ic finishComposingText len=0")
                 if (preeditEnabled) { // composition จบแบบไม่มี commitText มาแทน — feed สิ่งที่รวมไว้ 1 ครั้ง (เฉพาะหาง, ส่วน raw-write ไปแล้วไม่อยู่ใน preedit)
-                    preEdit.finish()?.let { feedText(it) }
+                    // F-2 (ticket 12): flush *ตามน้ำทันที* — ห้ามเลื่อน (user กด Enter/backspace ต่อทันที = คำหาย);
+                    // finish() เปิด correction window ให้ dance (commit/composing/delete ถัดไป = replace แบบ delta)
+                    val fed = preEdit.finish() // hw-backlog/10: path นี้เคย feed เงียบ 100% (silent path 3)
+                    if (fed != null) imeTrace("finish len=${fed.codePointCount(0, fed.length)}")
+                    else if (preEdit.correctionOpen) {
+                        // finish ซ้ำตอน region ว่าง (IME teardown/stray) = จบการแก้จริง — ปิด window, ไม่มีอะไร feed เพิ่ม
+                        preEdit.closeCorrection()
+                        imeTrace("preedit close finish")
+                    }
+                    fed?.let { feedText(it) }
                     rawSentText = ""
                     invalidate()
                 }
                 return super.finishComposingText()
             }
-            override fun deleteSurroundingText(beforeLength: Int, afterLength: Int): Boolean {
+            // ticket 12: ทุก overload ของ deleteSurroundingText ที่ base class declares ถูก override แล้ว
+            // routing เข้า handler เดียว (javap ไม่รันได้ใน session นี้ — ดู ticket; `override` = compiler ตรวจ
+            // signature กับ android.jar จริงตอน build: ผิดตัวเดียว compile fail)
+            override fun deleteSurroundingText(beforeLength: Int, afterLength: Int): Boolean =
+                deleteSurrounding("deleteSurroundingText", beforeLength, afterLength)
+            // API 30+: ตัวที่ IME ยุคใหม่ชอบเรียก (นับ code points) — 0.5.17 ไม่ override = silent path
+            override fun deleteSurroundingTextInCodePoints(beforeLength: Int, afterLength: Int): Boolean =
+                deleteSurrounding("deleteSurroundingTextInCodePoints", beforeLength, afterLength)
+
+            /** handler เดียวของทุก deleteSurroundingText overload (ticket 12) */
+            private fun deleteSurrounding(via: String, beforeLength: Int, afterLength: Int): Boolean {
+                imeTrace("ic $via before=$beforeLength after=$afterLength") // ticket 12: เลิก hardcode len=0 — dance เดิมแยกไม่ออกจาก log
+                if (beforeLength <= 0 && afterLength <= 0) {
+                    // F-2 (ticket 12): (0,0) = no-op ตาม contract (Gboard ใช้เป็น dance marker — วัดจริงใน log)
+                    // บั๊กเดิม: fall-through ส่ง 0x7f ปลอมเข้า PTY ทุกครั้งที่ IME เรียก (side-finding ของ F-2)
+                    return true
+                }
                 // T5: backspace ขณะ composing = ยุบ preedit ก่อน; ว่างแล้วค่อย DEL (path เดิม)
                 if (preeditEnabled && beforeLength > 0 && preEdit.shrinkBefore(beforeLength)) {
+                    if (!preEdit.active) imeTrace("preedit close backspace") // hw-backlog/10: region ยุบจนว่าง = transition (soft backspace)
                     invalidate(); return true
                 }
+                // F-2: region ว่าง + correction window เปิด = ลบคำที่เพิ่ง flush — หด window + ส่ง DEL ตามจำนวนจริง
+                // (window คงเปิด: Gboard ลบแล้วแก้ต่อ — design: delete that actually deletes keeps the window)
+                if (preeditEnabled) {
+                    val del = preEdit.correctionDelete(beforeLength)
+                    if (del >= 0) {
+                        imeTrace("del-finished len=$del")
+                        danceFeed = true
+                        try { if (del > 0) feedBytes(ByteArray(del) { 0x7f.toByte() }) } finally { danceFeed = false }
+                        invalidate(); return true
+                    }
+                }
+                // hw-backlog/10 (audit): DEL ขณะ region ว่าง = ส่ง 0x7f (control, ไม่ใช่ text) — นับ "len ≡ จอ"
+                // ไม่ต้องมีบรรทัดเพราะไม่เพิ่มอักขระบนจอ;backspace ฝั่ง hardware = คีย์ physical ไม่มี strike ใด log เดิม
                 feedBytes(byteArrayOf(0x7f)); return true // ผ่าน funnel = ได้ reveal-on-input ด้วย (≡ key)
             }
             override fun sendKeyEvent(event: KeyEvent): Boolean {
+                imeTrace("ic sendKeyEvent action=${event.action} len=${traceLen(event.characters)}")
+                // F-2 (ticket 12): keyevent = เหตุการณ์จริง (Gboard space/backspace ผ่านทางนี้) — window ปิด
+                // (dispatchKey ทำซ้ำไม่อันตราย — idempotent; ACTION_UP ที่ return เร็วกว่า dispatchKey ก็ได้ปิดแล้ว)
+                if (preeditEnabled) preEdit.closeCorrection()
+                // hw-backlog/10 round 27: ACTION_MULTIPLE + characters = IME ยัดทั้งก้อนผ่าน keyevent —
+                // บันทึกไว้ว่ามากี่ตัว (code points) เท่านั้น; *ห้าม feed ที่นี่* การเปลี่ยน delivery
+                // ของ path นี้คือ behavior change = รอ user อนุมัติก่อน (ตั๋ว 08 wontfix territory)
+                if (event.action == KeyEvent.ACTION_MULTIPLE && event.characters != null) {
+                    imeTrace("multiple len=${traceLen(event.characters)}")
+                }
                 // วัดจริง (T5 trace): Gboard ส่ง keyevent ทั้ง DOWN และ UP — dispatchKey ห้ามป้อนซ้ำตอน UP
                 // (bug เดิม: soft backspace = 0x7f สองครั้ง; UP = consume อย่างเดียว)
                 if (event.action == KeyEvent.ACTION_UP) return true
-                return dispatchKey(event) || super.sendKeyEvent(event)
+                return dispatchKey(event, fromIme = true) || super.sendKeyEvent(event)
+            }
+            // round 27 coverage: callback ที่ IME เรียกได้แต่เราไม่เคย override = ถึง PTY ผ่าน BaseInputConnection
+            // โดยไม่มีทางเห็นใน IME log เลย (วัดจริง honeyboard: ring ว่างทั้งที่พิมพ์ไทย) — ทุกตัว below =
+            // trace แล้วเรียก super เดิม = zero behavior change; label+len เท่านั้น ห้ามเนื้อหา text
+            override fun commitCompletion(text: CompletionInfo): Boolean {
+                // CompletionInfo.text = CharSequence? (deprecated API33 แต่ minSdk29 ใช้งานหลัก; เนื้อหาไม่ลง log — นับ len อย่างเดียว)
+                imeTrace("ic commitCompletion len=${traceLen(text.text)}")
+                return super.commitCompletion(text)
+            }
+            override fun commitCorrection(info: CorrectionInfo): Boolean {
+                imeTrace("ic commitCorrection len=${traceLen(info.newText)}") // javap android-37 jar: getNewText()/getOldText() — ไม่มี field string/newString
+                return super.commitCorrection(info)
+            }
+            // ≡ BaseInputConnection.replaceText(int,int,CharSequence,int,TextAttribute?) — ตัวที่ override ได้จริงใน SDK นี้
+            override fun replaceText(start: Int, end: Int, text: CharSequence, newCursorPosition: Int, attribute: TextAttribute?): Boolean {
+                imeTrace("ic replaceText len=${traceLen(text)}")
+                return super.replaceText(start, end, text, newCursorPosition, attribute)
+            }
+            override fun setComposingRegion(start: Int, end: Int): Boolean {
+                imeTrace("ic setComposingRegion len=0")
+                return super.setComposingRegion(start, end)
+            }
+            // SDK นี้ประกาศ performEditorAction(action): Boolean — propagating super's result = zero behavior change
+            override fun performEditorAction(editorAction: Int): Boolean {
+                imeTrace("ic performEditorAction len=0")
+                return super.performEditorAction(editorAction)
             }
         }
     }
@@ -992,14 +1168,19 @@ class TerminalView @JvmOverloads constructor(context: Context, attrs: AttributeS
         }
     }
 
-    /** map key → VT bytes; arrow/DECCKM ตาม engine.modes.appCursorKeys (vim/alt-screen) */
-    private fun dispatchKey(event: KeyEvent): Boolean {
+    /** map key → VT bytes; arrow/DECCKM ตาม engine.modes.appCursorKeys (vim/alt-screen)
+     * fromIme = src เป็น soft keyevent (InputConnection.sendKeyEvent) ไม่ใช่ physical key — ใช้ guard
+     * "log เฉพาะ unicodeChar feed จาก IME" กัน spam จาก arrow/modifier (hw-backlog/09) */
+    private fun dispatchKey(event: KeyEvent, fromIme: Boolean = false): Boolean {
+        // F-2 (ticket 12): key จริง (physical หรือ soft keyevent) = user ไปต่อแล้ว — ปิด correction window
+        // (ถ้าปล่อย open, dance commit มาทีหลังจะ DEL กิน bytes ของคีย์นี้ซึ่งอยู่นอก bookkeeping)
+        if (preeditEnabled) preEdit.closeCorrection()
         // T5: physical key ขณะ preedit active — DEL ยุบ preedit (ไม่ feed), ESC = discard แล้วปล่อยให้
         // table ข้างล่าง feed ESC 1 ครั้ง (≡ xterm: ทิ้ง composition, ESC ยังถึง app)
         if (preeditEnabled && preEdit.active) {
             when (event.keyCode) {
-                KeyEvent.KEYCODE_DEL -> { preEdit.shrinkBefore(1); invalidate(); return true }
-                KeyEvent.KEYCODE_ESCAPE -> { preEdit.clear(); rawSentText = ""; invalidate() }
+                KeyEvent.KEYCODE_DEL -> { preEdit.shrinkBefore(1); if (!preEdit.active) imeTrace("preedit close backspace"); invalidate(); return true } // hw-backlog/10: region ยุบจนว่าง = transition
+                KeyEvent.KEYCODE_ESCAPE -> { preEdit.clear(); imeTrace("preedit close esc"); rawSentText = ""; invalidate() } // ESC = lossy discard ต้องเห็นใน log
                 else -> Unit
             }
         }
@@ -1030,6 +1211,7 @@ class TerminalView @JvmOverloads constructor(context: Context, attrs: AttributeS
         }?.toByteArray(Charsets.UTF_8)
         if (bytes != null) { feedBytes(bytes); return true } // funnel เดียวกับ feedText (telemetry เห็นครบ)
         if (event.unicodeChar != 0 && event.isPrintingKey) {
+            if (fromIme) onImeKeyFeed?.invoke(event.unicodeChar) // hw-backlog/09: ทางเงียบที่ต้องมีหลักฐาน
             feedText(event.unicodeChar.toChar().toString()); return true
         }
         // T5 named-key table: บทเรียน space ตายที่ unicodeChar==0 — physical layout บางตัวไม่ give

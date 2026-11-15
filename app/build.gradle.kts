@@ -46,8 +46,13 @@ android {
         // scrollback), and a window strip driven by a `tmux -CC` control session
         // 0.5.14 (code 33): the history overlay is truly read-only (keys and keyboard stay out of the shell
         // while it is open), and switching tabs no longer drops the connection (control-channel close moved off the main thread)
-        versionCode = 33
-        versionName = "0.5.14"
+        // 0.5.15–0.5.17 (code 34–36): test builds used while chasing Thai input on real devices —
+        // never published; they only carried the ime log lines that made the next fix measurable
+        // 0.5.18 (code 37): Gboard's correction edits (re-typing a word it just sent) replace the word
+        // instead of appending a second copy of it in the native terminal; the ime log gained
+        // per-call tracing, codepoint feeds, and throttled skip lines
+        versionCode = 37
+        versionName = "0.5.18"
     }
 
     signingConfigs {

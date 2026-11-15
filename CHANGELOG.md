@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.5.18
+
+The fix round on Thai input with real keyboards, found on real devices (Honor Magic V6 with Gboard,
+Samsung Tab S10+ with the stock Samsung keyboard).
+
+### Thai typing
+
+- **Gboard's Thai correction no longer types the word twice.** When Gboard finishes a Thai word and
+  then edits it — retracting the word it just sent and re-suggesting a corrected version — the native
+  renderer used to append the corrected copy instead of replacing the first one. It now replays the
+  correction as a delta: the retract deletes what was already sent and the corrected tail is typed
+  once, exactly once. The correction window closes itself on any other input (keys bar, paste,
+  chords) so an edit that is interrupted mid-flight can't reach into the wrong word.
+- **A stray backspace per correction is gone.** The same Gboard edit sent a `deleteSurroundingText`
+  request with both lengths zero — a marker, not a delete. It used to fall through to the plain
+  backspace path and fire a real DEL into the shell; the zero-length call is now a no-op, matching
+  the InputConnection contract.
+- **Backspacing a finished word keeps working while a correction is open.** The delete deletes once,
+  the correction window shrinks to match, and further edits still replace the right text.
+
+### Diagnostics
+
+The IME log (the **A−** export) got honest enough to settle device arguments:
+
+- Every `InputConnection` entry is traced with real arguments (`deleteSurroundingText before=…
+  after=…` instead of a hardcoded `len=0`), so a keyboard's correction dance is readable from the log.
+- Preedit lifecycle events (open/close/finish/replace) are logged on every path that feeds the
+  terminal — the paths that used to move text in silence are now the loudest lines in the log.
+- Characters that arrive as raw key events (some Samsung keyboards deliver Thai this way) are logged
+  as code points.
+- Rejected multi-character writes log one skip line per source per 500 ms instead of one per write —
+  a ten-drag burst that used to eat the whole log ring in under a minute now leaves the interesting
+  lines alive.
+
+### Known limitations
+
+- Tapping a Thai tone mark as the very first key on the stock Samsung keyboard (honeyboard) can drop
+  the character before it ever reaches the app — the keyboard itself never calls the input
+  connection, so no terminal app can recover it. Gboard Thai is unaffected; as a workaround, type a
+  consonant first or use Gboard.
+
 ## 0.5.14
 
 Everything that landed since 0.5.12 ships here: the rest of the tmux set, plus two fixes found in

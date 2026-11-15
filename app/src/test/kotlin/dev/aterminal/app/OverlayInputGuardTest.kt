@@ -20,14 +20,6 @@ class OverlayInputGuardTest {
 
     private fun src() = File("src/main/kotlin/dev/aterminal/app/MainActivity.kt").readText()
 
-    private fun funBody(src: String, signature: String): String {
-        val start = src.indexOf(signature)
-        assertTrue("ต้องพบ $signature (renamed?)", start >= 0)
-        val end = src.indexOf("\n    }\n", start)
-        assertTrue("ต้องปิด body ของ $signature (หา indent ของ member fun ไม่เจอ)", end > start)
-        return src.substring(start, end)
-    }
-
     @Test fun `the gate exists and reads overlay state only`() {
         // gate เดียวจุดเดียว — ทุก funnel อ้างตัวเดียวกัน (กันคนละ guard คนละ semantics)
         val s = src()

@@ -14,14 +14,6 @@ class KeysBarAutoHideGuardTest {
 
     private fun src(name: String) = File("src/main/kotlin/dev/aterminal/app/$name").readText()
 
-    /** เนื้อหา fun ตั้งแต่ signature ถึงก่อน `private fun` ถัดไป (source-scan อย่างเดียว — ไม่มี Robolectric) */
-    private fun funBody(s: String, signature: String): String {
-        val start = s.indexOf(signature)
-        assertTrue("ต้องพบ $signature ใน MainActivity.kt", start >= 0)
-        val next = s.indexOf("\n    private fun ", start + 1)
-        return s.substring(start, if (next >= 0) next else s.length)
-    }
-
     @Test fun `applyKeysBars hides bars when toggle on and hardware keyboard present`() {
         val s = src("MainActivity.kt")
         val body = funBody(s, "private fun applyKeysBars()")

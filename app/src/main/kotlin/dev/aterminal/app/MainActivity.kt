@@ -1187,6 +1187,10 @@ class MainActivity : ComponentActivity() {
         tv.imeStrict = ImeSuggestions.strictNow(settings.imeSuggestions, hwKeyboardPresent()) // HW 11-05 (⌨️ ใน ⋮)
         // view เห็น InputConnection = รู้ว่า IME ยัง compose/เติมคำอยู่ → รายงานมา counted ที่นี่ที่เดียว
         tv.onImeAutocomplete = { kind, text -> noteImeAutocomplete(kind, text) }
+        // hw-backlog/09: อักขระทาง soft keyevent ไม่ผ่าน commitText = เงียบแล้วนับ log ↔ จอ ไม่ตรง
+        // เกณฑ์ (09): พิมพ์ ไก่ → บรรทัด feed รวม ≡ 3 codepoints; hex อย่างเดียว ห้ามมีตัวอักษร (log copy ได้)
+        tv.onImeKeyFeed = { cp -> imeLog("imeKey feed len=1 code=0x%04x".format(cp)) }
+        tv.onImeTrace = { d -> imeLog("imeSug $d") } // hw-backlog/10: preedit lifecycle (commit-in-composition/finish/preempt/flush-raw/open/close) — detail สร้างที่ view ไม่มีเนื้อหา text; ห้าม throttle (11-11: judgment lines ต้องรอด 500ms window)
         tv.palette = paletteFor(s.profile)
         tv.configure(s.fontSize * resources.displayMetrics.scaledDensity, fontFace)
         // T6 HUD ≡ Droid.findStatus (status strip เดียวกับ webview path; bar = overlay ของ wrapper)
@@ -1324,7 +1328,7 @@ class MainActivity : ComponentActivity() {
         for (id in manager.ids()) {
             val tab = manager.get(id) ?: continue
             for (p in tab.panes) if (p.pageReady) {
-                (p.view as? TerminalView)?.keymap = r.table // T4: native path — جدولเดียวกับการ push JS
+                (p.view as? TerminalView)?.keymap = r.table // T4: native path — ตารางเดียวกับการ push JS
                 p.js("window.AtermKeys && AtermKeys.setTable(${JSONObject.quote(keyTableJson)});")
             }
         }
@@ -1929,7 +1933,6 @@ class MainActivity : ComponentActivity() {
         runOnUiThread {
             val hintedFor = prefs().getString(PREF_IME_HINT, null)
             val imeId = currentImeId()
-            if (hintedFor != null && hintedFor == imeId) return@runOnUiThread // เตือนตัวนี้แล้ว = เงียบตลอด
             val now = android.os.SystemClock.elapsedRealtime()
             if (kind == ImeAutocomplete.Kind.COMPOSITION) lastCompositionAt = now
             // NaN = ไม่เคยเห็น composition เลย (ห้ามตีความเป็น "0 วินาที")
@@ -1940,7 +1943,11 @@ class MainActivity : ComponentActivity() {
             // "เราวัดไม่ถึง" (strict ปิดอยู่ / bridge ไม่ยิง / composing ค้าง true) จึงบันทึก *การตัดสิน*
             // ทุกครั้งลง IME log ที่ user คัดลอกเองได้ — เกณฑ์คือห้าม text ลง log (IME log ถูก copy ออก
             // นอกเครื่องได้) จึงบันทึกความยาวเท่านั้น
+            // round 27 (hw-backlog/10): บล็อกนี้ต้องอยู่ *ก่อน* hint-suppression return — IME ที่เตือน
+            // ไปแล้วเคยทำให้ ring บอดทั้งที่พิมพ์ไทยจริง (0 BURST/COMPOSITION lines); dialog ยังเงียบ
+            // เหมือนเดิม (return ถัดไป) = zero dialog behavior change, log ได้บรรทัดเพิ่มเท่านั้น
             imeLog("imeSug $kind len=${text.length} verdict=${if (counts) "count" else "ignore"} strict=$strict comp=$composing since=$since strikes=$imeStrikes ime=${imeId?.substringBefore('/') ?: "NONE"}")
+            if (hintedFor != null && hintedFor == imeId) return@runOnUiThread // เตือนตัวนี้แล้ว = เงียบตลอด (เฉพาะ dialog — บรรทัด log ข้างบนถูกบันทึกแล้ว)
             if (!counts) return@runOnUiThread
             imeStrikes++
             if (!ImeAutocomplete.shouldHint(imeStrikes, hintedFor, imeId)) return@runOnUiThread
@@ -3094,23 +3101,43 @@ class MainActivity : ComponentActivity() {
         /** JS รายงาน composition (terminal.html → Droid.onImeComposing) — ใช้แยก "คำที่ IME เติม" ออกจาก "คำที่ compose อยู่" */
         @Volatile private var composing = false
         private var funnelProven = false
+        // hw-backlog/07 watch item (HW 11-11 Honor: drag ~10 ครั้ง = 301 skip lines กลืน 400-ring ใน 67s
+        // จน eviction บรรทัด judgement) → แผนสำรองที่เขียนรอไว้ในตั๋ว: บรรทัดแรกต่อ source ต่อ 500ms
+        private val skipLoggedAt = HashMap<String, Long>()
 
         @JavascriptInterface
-        // round 21: transform ก่อน write = Gboard تحت CTRL/⇧ ให้ผลเหมือน bar (user flow: กด CTRL ค้าง + ตัวอักษร)
+        // round 21: transform ก่อน write = Gboard ใต้ CTRL/⇧ ให้ผลเหมือน bar (user flow: กด CTRL ค้าง + ตัวอักษร)
         // HW 11-05 follow-up: [source] = ค่าที่ JS ติดป้ายมากับก้อน (ime/bar/paste) — funnel นี้รับทุก
         // upstream byte ไม่ใช่แค่สิ่งที่ user พิมพ์ จึงห้ามถือว่าทุกก้อนเป็นหลักฐานของ IME
         fun onInput(text: String, source: String?) {
-            val src = source ?: ImeAutocomplete.SRC_IME
+            // review 07: `source` เป็น free text จาก JS — log ต้อง bound จึง pin เฉ่าป้ายที่รู้จัก
+            // (ป้ายแปลกหน้า = ไม่เชื่อว่าเป็น ime = fail-soft ทิศเดียวตามกติกาเดิม)
+            val src = (source ?: ImeAutocomplete.SRC_IME).let {
+                if (it == ImeAutocomplete.SRC_IME || it == ImeAutocomplete.SRC_BAR || it == ImeAutocomplete.SRC_PASTE) it else "other"
+            }
             if (!funnelProven) { // หลักฐานว่า bridge ฝั่ง webview มีชีวิต (แยก "IME ไม่ดื้อ" จาก "เราไม่ได้ยิน")
                 funnelProven = true
                 imeLog("imeSug webview funnel alive (first write len=${text.length} src=$src)")
             }
             // สัญญาณ IME จริง = ก้อนจาก textarea เท่านั้น และต้องไม่มี control byte (mouse report
             // `ESC[<32;42;12M` ของ drag ใน tmux = 12 ตัวอักษร 9 ก้อน = เคยทำให้ log หลอก)
-            if (text.length > 1 && src == ImeAutocomplete.SRC_IME && ImeAutocomplete.plausibleImeText(text)) {
-                noteImeAutocomplete(ImeAutocomplete.Kind.BURST, text, composing) // HW 11-05
+            // hw-backlog/07: ก้อนที่ถูกคัดทิ้งต้องทิ้งร่องรอยใน log ด้วย — ทำเงียบแล้วคนอ่าน log
+            // ยังต้องเดาว่าก้อนที่เห็นมาจากไหน (Honor 11-05 เสียเวลาไปหนึ่งรอบ) one drag ≈ 9 skip lines
+            // = load ใหม่บน ring 400 ที่ budget เดิม (≲40 บรรทัด) เคยจ่ายไว้แล้วด้วย writes ที่ผ่านการพิจารณา
+            if (text.length > 1) {
+                val ctrl = !ImeAutocomplete.plausibleImeText(text) // control byte = protocol traffic ไม่ใช่คำที่ IME แทรก
+                if (src == ImeAutocomplete.SRC_IME && !ctrl) {
+                    noteImeAutocomplete(ImeAutocomplete.Kind.BURST, text, composing) // HW 11-05
+                } else {
+                    // protocol traffic ติดกันรัว (drag = ~30 reports) = พิมพ์เฉพาะบรรทัดแรกต่อป้ายต่อ 500ms
+                    val now = android.os.SystemClock.elapsedRealtime()
+                    if (now - (skipLoggedAt[src] ?: -SKIP_LOG_THROTTLE_MS) >= SKIP_LOG_THROTTLE_MS) { // ?: ตัวลบ = บรรทัดแรกผ่านเสมอ (MIN_VALUE = ลบแล้ว overflow)
+                        skipLoggedAt[src] = now
+                        imeLog("imeSug skip len=${text.length} src=$src ctrl=$ctrl") // ห้ามใส่ตัว text (IME log ออกนอกเครื่องได้)
+                    }
+                }
             }
-            // round 21: transform ก่อน write = Gboard تحت CTRL/⇧ ให้ผลเหมือน bar (tmux/05: pending ครอบชั้นนอก)
+            // round 21: transform ก่อน write = Gboard ใต้ CTRL/⇧ ให้ผลเหมือน bar (tmux/05: pending ครอบชั้นนอก)
             // review fix: ก้อน src=paste (Aterm.paste ติดป้าย) = block input → disarm ทิ้ง prefix เสมอ
             // (JS round-trip แล่นหลัง disarm ที่ pasteNow แล้ว — กันเค้าวาง pending *ระหว่าง* แล่น: ESC[200~ ห้ามโดน prepend)
             val m = mods.transform(text)
@@ -3346,6 +3373,7 @@ class MainActivity : ComponentActivity() {
     companion object {
         private const val REQ_NOTIFICATIONS = 4101
         private const val PREF_IME_HINT = "imeHintShownFor" // HW 11-05: จำ IME ที่ถูกพาไปตั้งค่าแล้ว
+        private const val SKIP_LOG_THROTTLE_MS = 500L // hw-backlog/07: skip line ≤1 ครั้งต่อ source ต่อหน้าต่างนี้
         private const val PANE_FOCUS = 0xFF3DA0FF.toInt()   // กรอบ focused pane (accent เดียวกับ theme)
         private const val CRASH_LOOP_WINDOW_MS = 15_000L    // T4: boot ใหม่ไวเกินไปหลัง restore attempt = ข้าม restore ครั้งเดียว
         private const val TITLE_DEBOUNCE_MS = 500L          // tmux/04: trailing window ของ OSC title → pill
